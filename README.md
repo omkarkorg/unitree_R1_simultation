@@ -4,6 +4,8 @@ Whole-body teleoperation of a simulated **Unitree R1** humanoid with two **Brain
 
 In the headset you stand in your own room (colour pass-through) with the robot's table and a side table drawn into it. The robot's palms go where your palms are, each finger bends as far as yours, and the body walks, turns, squats and leans with you. The table holds an assembly kit: a peg board, a gear train, a Tower of Hanoi and a nut on a threaded bolt. Sessions can be recorded as demonstrations for imitation learning.
 
+<img width="1920" height="1080" alt="R1 Simulation 00:00:08" src="https://github.com/user-attachments/assets/7144057c-e99b-4c25-90a0-151bcf3b5917" />
+
 ## Features
 
 - Unitree R1 (26 DoF, 5-DoF arms) with two BrainCo Revo 2 hands (6 motors, 11 joints each), composed from Unitree's official URDFs at image build time
