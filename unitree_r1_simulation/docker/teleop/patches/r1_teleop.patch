@@ -1,0 +1,1738 @@
+--- a/teleop/teleop_hand_and_arm.py
++++ b/teleop/teleop_hand_and_arm.py
+@@ -2,6 +2,7 @@
+ import argparse
+ from multiprocessing import Value, Array, Lock
+ import threading
++import numpy as np
+ import logging_mp
+ logging_mp.basicConfig(level=logging_mp.INFO)
+ logger_mp = logging_mp.getLogger(__name__)
+@@ -36,6 +37,7 @@
+ READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
+ RECORD_RUNNING = False  # True if [Recording]
+ RECORD_TOGGLE  = False  # Toggle recording state
++REQUEST        = None
+ #  -------        ---------                -----------                -----------            ---------
+ #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
+ #  -------        ---------      |         -----------      |         -----------      |     ---------
+@@ -49,7 +51,7 @@
+ #  --> auto  : Auto-transition after saving data.
+ 
+ def on_press(key):
+-    global STOP, START, RECORD_TOGGLE
++    global STOP, START, RECORD_TOGGLE, REQUEST
+     if key == 'r':
+         START = True
+     elif key == 'q':
+@@ -57,6 +59,8 @@
+         STOP = True
+     elif key == 's' and START == True:
+         RECORD_TOGGLE = True
++    elif key in ('c', 'x'):
++        REQUEST = "restart" if key == 'c' else "reset"
+     else:
+         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
+ 
+@@ -70,10 +74,702 @@
+         "RECORD_RUNNING": RECORD_RUNNING,
+     }
+ 
++def overlay_text(bgr, lines, binocular):
++    import cv2
++    img = bgr.copy()
++    h, w = img.shape[:2]
++    eye_w = w // 2 if binocular else w
++    shift = int(0.023 * h) if binocular else 0
++    for x0, dx in (((0, shift), (eye_w, -shift)) if binocular else ((0, 0),)):
++        y = int(0.30 * h)
++        for text, size in lines:
++            scale = size * h / 480.0
++            thick = max(2, int(round(2.5 * scale)))
++            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
++            org = (x0 + (eye_w - tw) // 2 + dx, y + th)
++            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thick + 6, cv2.LINE_AA)
++            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thick, cv2.LINE_AA)
++            y += th + int(0.06 * h)
++    return img
++
++def relative_target(robot0, human0, human, robot_now, human_prev):
++    target = np.eye(4)
++    target[:3, 3] = robot0[:3, 3] + (human[:3, 3] - human0[:3, 3])
++    target[:3, :3] = robot_now[:3, :3] @ human_prev[:3, :3].T @ human[:3, :3]
++    return target
++
++HANDS_MISSING = [("SHOW BOTH HANDS", 1.0), ("controllers down, hands in view", 0.55)]
++HANDS_LOST = [("HANDS LOST", 1.0), ("show both hands to continue", 0.55)]
++CONTROLLERS_ACTIVE = [("CONTROLLERS ACTIVE", 1.0), ("put them down: the robot follows your hands", 0.55)]
++
++class HandWatch:
++    def __init__(self, tvuer, timeout=0.3):
++        self.tvuer, self.timeout, self.last = tvuer, timeout, float("-inf")
++        self.prev = self._raw()
++        self.updates = []
++
++    def _raw(self):
++        return np.concatenate([self.tvuer.left_arm_pose.ravel(), self.tvuer.right_arm_pose.ravel()])
++
++    def tracked(self, now):
++        raw = self._raw()
++        if not np.array_equal(raw, self.prev):
++            self.prev = raw
++            if all(abs(np.linalg.det(m.reshape(4, 4))) > 1e-6 for m in (raw[:16], raw[16:])):
++                self.last = now
++                self.updates = [t for t in self.updates if t > now - 2.0] + [now]
++        return now - self.last < self.timeout
++
++    def rate(self, now):
++        return len([t for t in self.updates if t > now - 2.0]) / 2.0
++
++class TrackingGate:
++    def __init__(self, tvuer, hand_watch, settle=0.3, reach=1.0):
++        self.tvuer, self.hands, self.settle, self.reach = tvuer, hand_watch, settle, reach
++        self.ok_since, self.prev, self.prev_time = None, None, None
++
++    def in_vr(self, now):
++        return now - self.tvuer.xr_event_time < 0.5
++
++    def controllers_in_use(self, now):
++        return now - self.tvuer.controller_move_time < 0.5
++
++    def _glitch(self, now):
++        poses = (self.tvuer.left_arm_pose, self.tvuer.right_arm_pose)
++        if self.prev is not None and all(np.array_equal(a, b) for a, b in zip(poses, self.prev)):
++            return None
++        jump, dt = None, (now - self.prev_time) if self.prev is not None else None
++        if dt is not None and dt < 0.2:
++            for a, b in zip(poses, self.prev):
++                moved = np.linalg.norm(a[:3, 3] - b[:3, 3])
++                turned = np.arccos(np.clip((np.trace(a[:3, :3].T @ b[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))
++                if moved > 0.05 + 3.0 * dt or turned > 0.3 + 25.0 * dt:
++                    jump = f"tracking jump ({moved * 100:.0f} cm, {np.degrees(turned):.0f} deg in {dt * 1000:.0f} ms)"
++        self.prev, self.prev_time = poses, now
++        return jump
++
++    def check(self, now):
++        tracked = self.hands.tracked(now)
++        glitch = self._glitch(now) if tracked else None
++        head = self.tvuer.head_pose[:3, 3]
++        far = tracked and any(np.linalg.norm(m[:3, 3] - head) > self.reach for m in (self.tvuer.left_arm_pose, self.tvuer.right_arm_pose))
++        reason = ("headset not in VR" if not self.in_vr(now) else
++                  ("controllers in use" if self.controllers_in_use(now) else "hands not tracked") if not tracked else
++                  glitch if glitch else
++                  "a hand is out of reach of the head" if far else None)
++        if reason is not None:
++            self.ok_since = None
++            return False, reason
++        if self.ok_since is None:
++            self.ok_since = now
++        return now - self.ok_since >= self.settle, "settling"
++
++def message_for(reason, running):
++    if reason == "controllers in use":
++        return CONTROLLERS_ACTIVE
++    if reason == "using a button":
++        return None if running else [("HANDS TO THE TABLE", 0.8), ("then the countdown starts", 0.45)]
++    return HANDS_LOST if running else HANDS_MISSING
++
++from televuer.tv_wrapper import (T_ROBOT_OPENXR, T_OPENXR_ROBOT, R_OPENXR_ROBOT, T_TO_UNITREE_HUMANOID_LEFT_ARM,
++                                 T_TO_UNITREE_HUMANOID_RIGHT_ARM, get_Brobot_world_head_yaw_rot)
++
++HEAD_LIMITS = np.array([[-0.60, 0.60], [-1.95, 1.95]])
++
++def rot_y(a):
++    c, s = np.cos(a), np.sin(a)
++    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
++
++def rot_z(a):
++    c, s = np.cos(a), np.sin(a)
++    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
++
++def camera_rotation(head_q, mount_pitch):
++    sm, cm = np.sin(mount_pitch), np.cos(mount_pitch)
++    link_camera = np.array([[0.0, sm, -cm], [-1.0, 0.0, 0.0], [0.0, cm, sm]])
++    return rot_y(head_q[0]) @ rot_z(head_q[1]) @ link_camera
++
++def head_joints_for(gaze, mount_pitch):
++    g = gaze / np.linalg.norm(gaze)
++    sm, cm = np.sin(mount_pitch), np.cos(mount_pitch)
++    best, yaw0 = None, np.arcsin(np.clip(g[1] / cm, -1.0, 1.0))
++    for yaw in (yaw0, np.pi - yaw0):
++        pitch = np.arctan2(-sm, cm * np.cos(yaw)) - np.arctan2(g[2], g[0])
++        q = np.clip((np.array([pitch, yaw]) + np.pi) % (2.0 * np.pi) - np.pi, HEAD_LIMITS[:, 0], HEAD_LIMITS[:, 1])
++        alignment = -camera_rotation(q, mount_pitch)[:, 2] @ g
++        if best is None or alignment > best[0]:
++            best = (alignment, q)
++    return best[1]
++
++class OperatorFrame:
++    def __init__(self, tvuer):
++        self.tvuer, self.heading, self.version = tvuer, None, 0
++        self.last_head, self.last_vr = None, float("-inf")
++        self.eye_xr = None
++        self.history = []
++        self.world_scale, self.robot_eye_z = 1.0, None
++        self.scale = 1.0
++
++    def head(self):
++        raw = self.tvuer.head_pose
++        return T_ROBOT_OPENXR @ raw @ T_OPENXR_ROBOT if abs(np.linalg.det(raw[:3, :3])) > 0.5 else None
++
++    def update(self, now, in_vr):
++        head = self.head()
++        if not in_vr or head is None:
++            return
++        self.history = [h for h in self.history if h[0] > now - 1.0] + [(now, head[:3, 0].copy(), self.tvuer.head_pose[:3, 3].copy())]
++        reason = None
++        if self.heading is None:
++            reason = "headset in VR"
++        elif now - self.last_vr > 2.0:
++            reason = "headset back in VR"
++        elif self.last_head is not None:
++            turned = np.arccos(np.clip((np.trace(self.last_head[:3, :3].T @ head[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))
++            if np.linalg.norm(head[:3, 3] - self.last_head[:3, 3]) > 0.3 or turned > 0.8:
++                reason = "view recentred"
++        if reason:
++            self.heading = get_Brobot_world_head_yaw_rot(head[:3, :3])
++            self.eye_xr = self.tvuer.head_pose[:3, 3].copy()
++            self.version += 1
++            logger_mp.info(f"🧭  {reason}: the robot's forward is now the direction you face")
++        self.last_head, self.last_vr = head, now
++
++    def calibrate(self, now, span=0.5):
++        recent = [h for h in self.history if h[0] > now - span]
++        if not recent:
++            return False
++        forward = np.mean([h[1] for h in recent], axis=0)
++        self.heading = get_Brobot_world_head_yaw_rot(np.column_stack([forward, np.zeros(3), np.zeros(3)]))
++        self.eye_xr = np.mean([h[2] for h in recent], axis=0)
++        self.version += 1
++        logger_mp.info("🧭  GO: the robot's eyes are now where yours are, its forward where you looked")
++        return True
++
++    def placement(self, eye_sim, robot_yaw=0.0):
++        s = self.world_scale
++        if s is None:
++            s = float(np.clip(self.eye_xr[1] / (self.robot_eye_z or eye_sim[2]), 1.0, MAX_WORLD_SCALE))
++        R = R_OPENXR_ROBOT @ self.heading @ rot_z(-robot_yaw)
++        T = np.eye(4)
++        T[:3, :3] = s * R
++        T[:3, 3] = self.eye_xr - s * R @ eye_sim
++        self.scale = s
++        return T
++
++    def gaze(self):
++        head = self.head()
++        return None if self.heading is None or head is None else self.heading.T @ head[:3, 0]
++
++    def wrists(self):
++        poses = []
++        for raw, to_arm in ((self.tvuer.left_arm_pose, T_TO_UNITREE_HUMANOID_LEFT_ARM),
++                            (self.tvuer.right_arm_pose, T_TO_UNITREE_HUMANOID_RIGHT_ARM)):
++            pose = T_ROBOT_OPENXR @ raw @ T_OPENXR_ROBOT @ to_arm
++            pose[:3, :3], pose[:3, 3] = self.heading.T @ pose[:3, :3], self.heading.T @ pose[:3, 3]
++            poses.append(pose)
++        return poses
++
++    def to_openxr(self, rotation_body):
++        return R_OPENXR_ROBOT @ self.heading @ rotation_body
++
++R1_MODEL_URDF = "/opt/r1_model/r1_brainco.urdf"
++R1_VR_MESHES = "/opt/r1_vr/robot_meshes.npz"
++
++MAX_WORLD_SCALE = 1.7
++
++def to_room(T, P):
++    Q = T @ P
++    Q[:3, :3] /= np.linalg.norm(T[:3, 0])
++    return Q
++
++def from_room(T, P):
++    Q = np.linalg.inv(T) @ P
++    Q[:3, :3] *= np.linalg.norm(T[:3, 0])
++    return Q
++
++def palm_frame(wrist, middle, index, pinky):
++    x = middle - wrist
++    x = x / max(np.linalg.norm(x), 1e-9)
++    y = index - pinky
++    y = y - x * (x @ y)
++    y = y / max(np.linalg.norm(y), 1e-9)
++    T = np.eye(4)
++    T[:3, :3] = np.column_stack([x, y, np.cross(x, y)])
++    T[:3, 3] = 0.5 * (wrist + middle)
++    return T
++
++def operator_palm(points):
++    return palm_frame(points[0], points[11], points[6], points[21])
++
++class RobotGeometry:
++    def __init__(self, urdf, camera_mount):
++        import pinocchio as pin
++        model = pin.buildModelFromUrdf(urdf)
++        data = model.createData()
++        pin.framesForwardKinematics(model, data, pin.neutral(model))
++        def pose(name):
++            fid = model.getFrameId(name)
++            if fid >= model.nframes:
++                raise ValueError(f"{urdf} has no frame {name}")
++            return data.oMf[fid].homogeneous.copy()
++        self.palm_in_wrist = {}
++        for side in ("left", "right"):
++            p = lambda link: pose(f"{side}_{link}")[:3, 3]
++            palm = palm_frame(p("hand_palm_link"), p("middle_proximal_link"), p("index_proximal_link"), p("pinky_proximal_link"))
++            self.palm_in_wrist[side] = np.linalg.inv(pose(f"{side}_wrist_roll_link")) @ palm
++        self.eye = (pose("head_yaw_link") @ np.append(np.asarray(camera_mount, dtype=float), 1.0))[:3]
++        self.shoulder = {side: pose(f"{side}_shoulder_pitch_link")[:3, 3] for side in ("left", "right")}
++        self.ik_origin = pose("waist_yaw_link")[:3, 3]
++        self.wrist_inertia = {}
++        for side in ("left", "right"):
++            jid = model.getJointId(f"{side}_wrist_roll_joint")
++            total = pin.Inertia.Zero()
++            for j in model.subtrees[jid]:
++                total += (data.oMi[jid].inverse() * data.oMi[j]).act(model.inertias[j])
++            self.wrist_inertia[side] = total
++        i = model.joints[model.getJointId("left_elbow_joint")].idx_q
++        def palm_distance(elbow):
++            q = pin.neutral(model)
++            q[i] = elbow
++            pin.framesForwardKinematics(model, data, q)
++            return float(np.linalg.norm((pose("left_wrist_roll_link") @ self.palm_in_wrist["left"])[:3, 3]
++                                        - pose("left_shoulder_pitch_link")[:3, 3]))
++        self.reach = 0.9 * max(palm_distance(e) for e in np.linspace(model.lowerPositionLimit[i], model.upperPositionLimit[i], 64))
++
++def pose_from_xyzw(pose):
++    x, y, z, qx, qy, qz, qw = [float(v) for v in pose]
++    T = np.eye(4)
++    T[:3, :3] = [[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
++                 [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
++                 [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)]]
++    T[:3, 3] = [x, y, z]
++    return T
++
++def rotation_log(R):
++    angle = np.arccos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0))
++    if angle < 1e-9:
++        return np.zeros(3)
++    v = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
++    s = np.linalg.norm(v)
++    return v / s * angle if s > 1e-9 else np.zeros(3)
++
++def rotation_exp(w):
++    angle = np.linalg.norm(w)
++    if angle < 1e-12:
++        return np.eye(3)
++    k = w / angle
++    K = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
++    return np.eye(3) + np.sin(angle) * K + (1.0 - np.cos(angle)) * K @ K
++
++class OneEuroPose:
++    def __init__(self, min_cutoff=4.0, beta=40.0, beta_rot=4.0, d_cutoff=5.0):
++        self.min_cutoff, self.beta, self.beta_rot, self.d_cutoff = min_cutoff, beta, beta_rot, d_cutoff
++        self.reset()
++
++    def reset(self):
++        self.T, self.t, self.v, self.w = None, None, 0.0, 0.0
++
++    @staticmethod
++    def _alpha(cutoff, dt):
++        return 1.0 / (1.0 + 1.0 / (2.0 * np.pi * cutoff * dt))
++
++    def __call__(self, T, t):
++        if self.T is None:
++            self.T, self.t = T.copy(), t
++            return T.copy()
++        dt = max(t - self.t, 1e-3)
++        a_d = self._alpha(self.d_cutoff, dt)
++        step = T[:3, 3] - self.T[:3, 3]
++        self.v = a_d * np.linalg.norm(step) / dt + (1.0 - a_d) * self.v
++        turn = rotation_log(self.T[:3, :3].T @ T[:3, :3])
++        self.w = a_d * np.linalg.norm(turn) / dt + (1.0 - a_d) * self.w
++        out = np.eye(4)
++        out[:3, 3] = self.T[:3, 3] + self._alpha(self.min_cutoff + self.beta * self.v, dt) * step
++        out[:3, :3] = self.T[:3, :3] @ rotation_exp(self._alpha(self.min_cutoff + self.beta_rot * self.w, dt) * turn)
++        self.T, self.t = out, t
++        return out.copy()
++
++class OperatorPalm:
++    def __init__(self, tau=2.0):
++        self.tau, self.offset, self.t = tau, None, None
++
++    def __call__(self, points, wrist_pose, t):
++        built = operator_palm(points)
++        R_wrist = wrist_pose[:3, :3]
++        now = R_wrist.T @ built[:3, :3]
++        if self.offset is None:
++            self.offset = now
++        else:
++            a = 1.0 - np.exp(-min(max(t - self.t, 0.0), 0.5) / self.tau)
++            self.offset = self.offset @ rotation_exp(a * rotation_log(self.offset.T @ now))
++        self.t = t
++        out = built.copy()
++        out[:3, :3] = R_wrist @ self.offset
++        return out
++
++def panel_pose(center, eye):
++    n = np.asarray(eye, dtype=float) - center
++    n /= np.linalg.norm(n)
++    v = np.array([0.0, 0.0, 1.0]) - n[2] * n
++    v /= np.linalg.norm(v)
++    T = np.eye(4)
++    T[:3, :3] = np.column_stack([np.cross(v, n), v, n])
++    T[:3, 3] = center
++    return T
++
++class VRButtons:
++    SIZE = (0.12, 0.07)
++    ANCHORS = {"exit": (0.34, 0.66, 1.24), "reset": (0.34, 0.66, 1.115), "restart": (0.34, 0.66, 0.99),
++               "start": (0.34, 0.66, 0.865), "rec": (0.34, 0.66, 0.74)}
++    NEAR, FRONT, TOUCH, BEHIND, MARGIN, REARM = 0.20, 0.12, 0.012, 0.04, 0.015, 1.0
++    CONFIRMED, CONFIRM = ("reset", "exit"), 4.0
++
++    def __init__(self, names=None):
++        self.names = list(names or self.ANCHORS)
++        self.poses = {}
++        self.zone = {}
++        self.last_press = {}
++        self.armed = {}
++        self.hover, self.near = set(), False
++
++    def place(self, placement, eye_sim):
++        R = placement[:3, :3] / np.linalg.norm(placement[:3, 0])
++        T = np.eye(4)
++        T[:3, :3] = R
++        T[:3, 3] = (placement @ np.append(eye_sim, 1.0))[:3] - R @ eye_sim
++        for name in self.names:
++            self.poses[name] = T @ panel_pose(np.array(self.ANCHORS[name], dtype=float), eye_sim)
++
++    def confirm(self, now, name):
++        if now < self.armed.pop(name, -1.0):
++            return True
++        self.armed[name] = now + self.CONFIRM
++        return False
++
++    def step(self, now, fingertips):
++        pressed, self.hover, self.near = [], set(), False
++        for name, T in self.poses.items():
++            c, u, v, n = T[:3, 3], T[:3, 0], T[:3, 1], T[:3, 2]
++            for k, tip in enumerate(fingertips):
++                rel = tip - c
++                self.near |= np.linalg.norm(rel) < self.NEAR
++                inside = abs(rel @ u) <= self.SIZE[0] / 2 + self.MARGIN and abs(rel @ v) <= self.SIZE[1] / 2 + self.MARGIN
++                d = rel @ n
++                zone = "out" if not inside else "front" if self.TOUCH < d < self.FRONT else "touch" if -self.BEHIND <= d <= self.TOUCH else "out"
++                prev = self.zone.get((name, k), "out")
++                if zone != "out":
++                    self.hover.add(name)
++                if zone == "touch" and prev == "front" and now - self.last_press.get(name, -1e9) > self.REARM:
++                    self.last_press[name] = now
++                    pressed.append(name)
++                self.zone[(name, k)] = zone
++            for k in range(len(fingertips), 2):
++                self.zone[(name, k)] = "out"
++        return pressed
++
++    def panels(self, now, labels):
++        out = []
++        for name, T in self.poses.items():
++            text, colour, enabled = labels[name]
++            flash = now - self.last_press.get(name, -1e9) < 0.4
++            bg = np.array(colour, dtype=float)
++            if flash:
++                bg = 0.4 * bg + 0.6 * 255.0
++            elif name in self.hover and enabled:
++                bg = 0.7 * bg + 0.3 * 255.0
++            out.append({"key": f"ui-button-{name}", "size": list(self.SIZE), "matrix": T.flatten(order="F").tolist(),
++                        "bg": [int(c) for c in bg], "fg": [255, 255, 255] if enabled else [200, 200, 200],
++                        "border": [255, 255, 255] if name in self.hover else [20, 20, 20],
++                        "lines": [[text, 1.0]] if isinstance(text, str) else [list(l) for l in text]})
++        return out
++
++CONFIRM_HINT = {"reset": "the robot and all parts back to the start", "exit": "ends the teleoperation"}
++
++def button_labels(now, armed, started, record, recording, rec_seconds):
++    def confirming(name, text, colour, armed_colour):
++        if now < armed.get(name, -1.0):
++            return [(f"{text}?", 1.0), ("press again", 0.55)], armed_colour, True
++        return text, colour, True
++    if not record:
++        rec = ("REC OFF", (95, 100, 108), True)
++    elif not started:
++        rec = ("REC", (120, 60, 60), False)
++    elif recording:
++        t = int(rec_seconds)
++        rec = (f"SAVE {t // 60}:{t % 60:02d}", (210, 40, 40), True)
++    else:
++        rec = ("REC", (190, 45, 45), True)
++    return {"start": ("START", (40, 150, 70), True) if not started else ("RUNNING", (90, 96, 104), False),
++            "rec": rec,
++            "restart": ("RESTART", (45, 105, 190), True) if started else ("RESTART", (60, 72, 96), False),
++            "reset": confirming("reset", "RESET", (180, 115, 30), (235, 150, 20)),
++            "exit": confirming("exit", "EXIT", (78, 82, 92), (205, 40, 40))}
++
++def ended_panel(head):
++    f = -head[:3, 2].copy()
++    f[1] = 0.0
++    f = f / np.linalg.norm(f) if np.linalg.norm(f) > 1e-6 else np.array([0.0, 0.0, -1.0])
++    y, z = np.array([0.0, 1.0, 0.0]), -f
++    T = np.eye(4)
++    T[:3, :3] = np.column_stack([np.cross(y, z), y, z])
++    T[:3, 3] = head[:3, 3] + 0.8 * f - np.array([0.0, 0.15, 0.0])
++    return {"key": "ui-ended", "size": [0.60, 0.22], "matrix": T.flatten(order="F").tolist(), "bg": [28, 32, 40],
++            "fg": [255, 255, 255], "border": [205, 40, 40],
++            "lines": [["TELEOPERATION ENDED", 0.8], ["you can leave VR or take off the headset now", 0.38]]}
++
++BOARD_ANCHOR, BOARD_SIZE = (1.15, 0.0, 0.97), (0.80, 0.26)
++SIDE_BOARD_ANCHOR = (0.10, -1.10, 1.05)
++
++class LabPoses:
++    JUMP, JUMP_SPEED = 0.15, 6.0
++
++    def __init__(self, url):
++        import json, zmq
++        self.root, self.q, self.stamp = None, None, 0.0
++        self.stance = None
++        self.sim_time, self.jumps = 0.0, 0
++        self._json = json
++        self._ctx = zmq.Context()
++        self._sock = self._ctx.socket(zmq.SUB)
++        self._sock.setsockopt(zmq.CONFLATE, 1)
++        self._sock.setsockopt(zmq.SUBSCRIBE, b"")
++        self._sock.connect(url)
++        self._stop = False
++        threading.Thread(target=self._run, daemon=True).start()
++
++    def _run(self):
++        while not self._stop:
++            if self._sock.poll(100):
++                msg = self._json.loads(self._sock.recv())
++                t = float(msg.get("t", 0.0))
++                if msg.get("root") is not None:
++                    root = pose_from_xyzw(msg["root"])
++                    if self.root is not None:
++                        d = float(np.linalg.norm(root[:3, 3] - self.root[:3, 3]))
++                        if d > self.JUMP and (t <= self.sim_time or d / (t - self.sim_time) > self.JUMP_SPEED):
++                            self.jumps += 1
++                    self.root = root
++                if msg.get("stance") is not None:
++                    self.stance = np.asarray(msg["stance"], dtype=float)
++                self.sim_time = t
++                self.q = np.asarray(msg["q"], dtype=float)
++                self.stamp = time.time()
++
++    def fresh(self, now, max_age=0.5):
++        return self.root is not None and now - self.stamp < max_age
++
++    def close(self):
++        self._stop = True
++
++def yaw_of(R):
++    return float(np.arctan2(R[1, 0], R[0, 0]))
++
++def wrap(a):
++    return float((a + np.pi) % (2.0 * np.pi) - np.pi)
++
++class BodyFollower:
++    LEASH, LEASH_PER_DROP, DEADBAND, WALK_START, K_POS = 0.08, 0.5, 0.04, 0.15, 1.8
++    YAW_LEASH, YAW_DEADBAND, TURN_START, K_YAW = np.radians(30.0), 0.10, 0.25, 1.8
++    V_MIN, WZ_MIN = 0.3, 0.6
++    VX, VY, WZ = (-0.3, 0.6), (-0.25, 0.25), 0.8
++    V_MAX, WZ_MAX, H_RATE, PITCH_RATE = 1.0, 2.0, 0.6, 1.5
++    H_NOM, H_MIN, PITCH_MAX = 0.725, 0.65, 0.55
++    NECK_TO_EYE = np.array([0.0805, 0.0, 0.075])
++    W_NECK, W_REACH, W_UPRIGHT, SMOOTH = 1.0, 4.0, 0.02, 0.15
++    HOLD_MARGIN = 2.25e-4
++    REACH_LEAN = 0.15
++
++    def __init__(self, geometry, send=None, body=None):
++        self.geo = geometry
++        body = body or {}
++        self.pose_mode = body.get("mode") == "exact"
++        self.H_MIN = float(body.get("h_min", self.H_MIN))
++        self.H_NOM = float(body.get("h_nom", self.H_NOM))
++        self.PITCH_MAX = float(body.get("pitch_max", self.PITCH_MAX))
++        if self.pose_mode:
++            self.REACH_LEAN = self.PITCH_MAX
++        if send is None:
++            import json
++            pub = ChannelPublisher("rt/sim/body_cmd", String_)
++            pub.Init()
++            send = lambda d: pub.Write(String_(data=json.dumps(d)))
++        self._send = send
++        hs = np.linspace(self.H_MIN, self.H_NOM, int(round((self.H_NOM - self.H_MIN) / 0.005)) + 1)
++        ps = np.linspace(0.0, self.PITCH_MAX, int(round(self.PITCH_MAX / 0.01)) + 1)
++        self.grid = np.array([(h, p) for h in hs for p in ps])
++        self.scale = 1.0
++        self.command = [0.0, 0.0, 0.0, self.H_NOM, 0.0]
++        self.sent = False
++        self.active = self.walking = self.turning = False
++
++    def neck_of(self, head):
++        return head[:3, 3] - head[:3, :3] @ self.NECK_TO_EYE / self.scale
++
++    def cost(self, h, p, neck, palms):
++        c, s = np.cos(p), np.sin(p)
++        n = self.neck
++        cost = self.W_NECK * ((c * n[0] + s * n[2] - neck[0]) ** 2 + (h - s * n[0] + c * n[2] - neck[1]) ** 2) \
++            + self.W_UPRIGHT * p ** 2
++        pr = np.minimum(p, self.REACH_LEAN)
++        cr, sr = np.cos(pr), np.sin(pr)
++        for side, palm in zip(("left", "right"), palms):
++            if palm is None:
++                continue
++            f, l, z = palm
++            q = self.geo.shoulder[side]
++            dist = np.sqrt((cr * q[0] + sr * q[2] - f) ** 2 + (q[1] - l) ** 2 + (h - sr * q[0] + cr * q[2] - z) ** 2)
++            cost = cost + self.W_REACH * np.maximum(dist - self.geo.reach, 0.0) ** 2
++        return cost
++
++    def start(self, root, eye_z, stance=None, head=None, scale=1.0):
++        self.scale = float(scale)
++        self.neck = self.geo.eye - self.NECK_TO_EYE / self.scale
++        self.anchor = root[:3, 3][:2].copy()
++        yaw = yaw_of(root[:3, :3])
++        c, s = np.cos(yaw), np.sin(yaw)
++        d = self.anchor - (stance if stance is not None else self.anchor)
++        self.stance_offset = np.array([c * d[0] + s * d[1], -s * d[0] + c * d[1]])
++        self.yaw_target = yaw
++        self.eye_z0 = float(eye_z)
++        self.h, self.p, self.t = self.H_NOM, 0.0, None
++        self.goal = np.array([self.H_NOM, 0.0])
++        self.pose = np.array([self.anchor[0], self.anchor[1], yaw, self.H_NOM, 0.0])
++        self.neck_offset = np.zeros(3)
++        if head is not None:
++            n = np.array([self.anchor[0] + c * self.neck[0] - s * self.neck[1],
++                          self.anchor[1] + s * self.neck[0] + c * self.neck[1], self.H_NOM + self.neck[2]]) - self.neck_of(head)
++            self.neck_offset = np.array([c * n[0] + s * n[1], -s * n[0] + c * n[1], n[2]])
++        self.walking = self.turning = False
++        self.active = True
++
++    def step(self, now, head, palms, root, moving, stance=None):
++        dt = 0.0 if self.t is None else min(max(now - self.t, 0.0), 0.2)
++        self.t = now
++        yaw_r = yaw_of(root[:3, :3])
++        neck_xy = self.neck[:2]
++        if moving:
++            gaze = head[:3, 0]
++            if np.hypot(gaze[0], gaze[1]) > 0.2:
++                d = wrap(np.arctan2(gaze[1], gaze[0]) - self.yaw_target)
++                if abs(d) > self.YAW_LEASH:
++                    self.yaw_target = wrap(self.yaw_target + d - np.sign(d) * self.YAW_LEASH)
++            c, s = np.cos(self.yaw_target), np.sin(self.yaw_target)
++            o = self.neck_offset
++            neck = self.neck_of(head) + np.array([c * o[0] - s * o[1], s * o[0] + c * o[1], o[2]])
++            want = neck[:2] - np.array([c * neck_xy[0] - s * neck_xy[1], s * neck_xy[0] + c * neck_xy[1]])
++            drop = max(0.0, self.eye_z0 - head[2, 3])
++            leash = self.LEASH / self.scale + self.LEASH_PER_DROP * drop
++            gap = want - self.anchor
++            if self.walking and not self.pose_mode:
++                self.anchor = want.copy()
++            elif np.linalg.norm(gap) > leash:
++                self.anchor = self.anchor + gap * (1.0 - leash / np.linalg.norm(gap))
++        if self.pose_mode:
++            stance = None
++        if stance is not None:
++            c, s = np.cos(yaw_r), np.sin(yaw_r)
++            o = self.stance_offset
++            err = self.anchor - (stance + np.array([c * o[0] - s * o[1], s * o[0] + c * o[1]]))
++        else:
++            err = self.anchor - root[:2, 3]
++        cr, sr = np.cos(yaw_r), np.sin(yaw_r)
++        e_body = np.array([cr * err[0] + sr * err[1], -sr * err[0] + cr * err[1]])
++        e_yaw = wrap(self.yaw_target - yaw_r)
++        self.walking = moving and not self.pose_mode and np.linalg.norm(e_body) > (self.DEADBAND if self.walking else self.WALK_START)
++        self.turning = moving and not self.pose_mode and abs(e_yaw) > (self.YAW_DEADBAND if self.turning else self.TURN_START)
++        v = self.K_POS * e_body if self.walking else np.zeros(2)
++        if self.walking and np.linalg.norm(v) < self.V_MIN:
++            v *= self.V_MIN / np.linalg.norm(v)
++        wz = self.K_YAW * e_yaw if self.turning else 0.0
++        if self.turning:
++            wz = float(np.sign(wz) * max(abs(wz), self.WZ_MIN))
++        vx, vy = float(np.clip(v[0], *self.VX)), float(np.clip(v[1], *self.VY))
++        wz = float(np.clip(wz, -self.WZ, self.WZ))
++        if moving:
++            c, s = np.cos(self.yaw_target), np.sin(self.yaw_target)
++            def body(p):
++                d = p[:2] - self.anchor
++                return c * d[0] + s * d[1], -s * d[0] + c * d[1], p[2]
++            nf, _, nz = body(neck)
++            reach = [None if palm is None else body(palm[:3, 3]) for palm in (palms or ())]
++            cost = self.cost(self.grid[:, 0], self.grid[:, 1], (nf, nz), reach)
++            k = int(np.argmin(cost))
++            if cost[k] < self.cost(self.goal[0], self.goal[1], (nf, nz), reach) - self.HOLD_MARGIN / self.scale ** 2:
++                self.goal = self.grid[k].copy()
++            h_want, p_want = self.goal
++            if self.walking or self.turning:
++                h_want, p_want = self.H_NOM, 0.0
++            a = 1.0 if dt <= 0.0 else 1.0 - np.exp(-dt / self.SMOOTH)
++            self.h += a * (h_want - self.h)
++            self.p += a * (p_want - self.p)
++        if self.pose_mode:
++            d = np.array([self.anchor[0], self.anchor[1], self.yaw_target, self.h, self.p]) - self.pose
++            d[2] = wrap(d[2])
++            dist = float(np.hypot(d[0], d[1]))
++            if dist > self.V_MAX * dt:
++                d[:2] *= self.V_MAX * dt / dist
++            for i, rate in ((2, self.WZ_MAX), (3, self.H_RATE), (4, self.PITCH_RATE)):
++                d[i] = float(np.clip(d[i], -rate * dt, rate * dt))
++            self.pose = self.pose + d
++            self.pose[2] = wrap(self.pose[2])
++            self.command = [float(v) for v in self.pose]
++        else:
++            self.command = [vx, vy, wz, float(self.h), float(self.p)]
++        self.publish()
++        return self.command
++
++    def pelvis(self):
++        if not (self.pose_mode and self.sent):
++            return None
++        x, y, yaw, h, p = self.command
++        c, s = np.cos(p), np.sin(p)
++        T = np.eye(4)
++        T[:3, :3] = rot_z(yaw) @ np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
++        T[:3, 3] = [x, y, h]
++        return T
++
++    def publish(self):
++        keys = ("x", "y", "yaw", "height", "pitch") if self.pose_mode else ("vx", "vy", "wz", "height", "pitch")
++        self._send({k: round(v, 4) for k, v in zip(keys, self.command)})
++        self.sent = True
++
++    def stand(self):
++        if not self.pose_mode:
++            self.command = [0.0, 0.0, 0.0, *self.command[3:]]
++        self.walking = self.turning = False
++        if self.sent or not self.pose_mode:
++            self.publish()
++
++    def stand_up(self, root=None):
++        if self.pose_mode:
++            if root is None:
++                return
++            self.command = [float(root[0, 3]), float(root[1, 3]), yaw_of(root[:3, :3]), self.H_NOM, 0.0]
++        else:
++            self.command = [0.0, 0.0, 0.0, self.H_NOM, 0.0]
++        self.walking = self.turning = False
++        self.publish()
++
++    def upright(self, root):
++        return abs(float(root[2, 3]) - self.H_NOM) < 0.04 and float(root[2, 2]) > np.cos(np.radians(7.0))
++
++def decode_head_frame(teleimage):
++    import cv2, json
++    jpg = teleimage.jpg
++    if jpg and jpg[2:4] == b"\xff\xfe":
++        try:
++            meta = json.loads(jpg[6:4 + int.from_bytes(jpg[4:6], "big")])
++            return cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR), np.array(meta["head_q"], dtype=float)
++        except (ValueError, KeyError):
++            pass
++    return teleimage.bgr, None
++
+ if __name__ == '__main__':
+     parser = argparse.ArgumentParser()
+     # basic control parameters
+     parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
++    parser.add_argument('--control-frequency', type=float, default=60.0, help='[R1 workspace patch] control loop rate (Hz); recording stays at --frequency')
+     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
+     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
+     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2', 'R1_A5', 'R1_A7'], default='G1_29', help='Select arm controller')
+@@ -86,6 +782,24 @@
+     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
+     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
+     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
++    parser.add_argument('--start-delay', type=float, default=2.0, help='seconds between [r] and the robot following you, to get into the start pose (0 = upstream behaviour)')
++    parser.add_argument('--ramp-time', type=float, default=1.0, help='seconds over which the arms then blend from their pose into yours (0 = jump)')
++    parser.add_argument('--arm-speed-limit', type=float, default=5.0, help='maximum speed of the arm joint commands in rad/s (0 = no limit, the upstream simulation behaviour)')
++    parser.add_argument('--wait-for-hands', type=int, default=1, help='1 = start the countdown only once the headset tracks both hands, and hold the arms while it does not (0 = upstream behaviour)')
++    parser.add_argument('--hand-mapping', choices=['exact', 'relative', 'unitree'], default='exact', help='exact = the robot\'s palms go where your palms are (the robot\'s eyes are put where yours are at GO); relative = the robot\'s hands copy your hand movements from where both were at GO; unitree = upstream absolute mapping (head-relative wrist + fixed offset)')
++    parser.add_argument('--finger-mapping', choices=['direct', 'dexpilot'], default='direct', help='direct = each BrainCo motor copies the matching angle of your hand; dexpilot = upstream fingertip retargeting')
++    parser.add_argument('--view', choices=['lab', 'camera'], default='lab', help='lab = the headset draws the simulated lab around you (needs the r1_sim simulator); camera = the head-camera image (upstream)')
++    parser.add_argument('--passthrough', type=int, default=1, help='lab view: 1 = draw only the robot, tables and objects - press "Pass-through" in the browser and they stand in your real room (Quest colour passthrough); 0 = draw the simulated room too (press "Virtual Reality")')
++    parser.add_argument('--world-scale', default='auto', help='lab view: the size the robot and everything around it are drawn at: auto = the robot at your size (its feet on your floor, its arms as long as yours; the hands then move the robot 1:scale), or a number, 1 = life size (the R1 is 1.2 m tall). The physics is not scaled')
++    parser.add_argument('--show-hands', type=int, default=1, help='lab view: 1 = small markers on your tracked hand joints')
++    parser.add_argument('--vr-buttons', type=int, default=1, help='1 = START (= key r) and REC (= key s) buttons in the headset, pressed with a fingertip')
++    parser.add_argument('--lab-fps', type=float, default=90.0, help='lab view: at most this many pose updates per second to the headset (each as soon as the simulator has it)')
++    parser.add_argument('--whole-body', type=int, default=0, help='1 = the robot walks, turns, squats and leans with you (r1_sim --locomotion 1: its leg controller takes rt/sim/body_cmd; the arms go through rt/arm_sdk as on the real R1, i.e. --motion)')
++    parser.add_argument('--head-tracking', type=int, default=1, help='1 = the robot head (pitch/yaw) turns where you look, from when the headset is in VR (0 = head held still, upstream behaviour)')
++    parser.add_argument('--head-speed-limit', type=float, default=3.0, help='maximum speed of the head joint commands in rad/s')
++    parser.add_argument('--immersive-view', type=int, default=1, help='1 = show the head-camera image life-size, fixed in the room where the camera looked, one image per eye (needs the camera field of view); 0 = upstream head-locked image')
++    parser.add_argument('--head-cam-vfov', type=float, default=None, help='head camera vertical field of view in degrees (default: from the image server)')
++    parser.add_argument('--head-cam-pitch', type=float, default=None, help='head camera tilt below the head\'s forward axis in degrees (default: from the image server, else 0)')
+     # record mode and task info
+     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
+     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
+@@ -96,6 +810,7 @@
+ 
+     args = parser.parse_args()
+     logger_mp.debug(f"args: {args}")
++    args.relative = args.hand_mapping == 'relative'
+ 
+     if args.ee == "dex1_internal" and args.motion:
+         parser.error("--ee dex1_internal does not currently support --motion.")
+@@ -123,6 +838,49 @@
+         camera_config = img_client.get_cam_config()
+         logger_mp.debug(f"Camera config: {camera_config}")
+         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
++        head_cam = camera_config['head_camera']
++        cam_vfov = args.head_cam_vfov if args.head_cam_vfov is not None else head_cam.get('vfov_deg')
++        cam_pitch = np.radians(args.head_cam_pitch if args.head_cam_pitch is not None else head_cam.get('pitch_deg', 0.0))
++        lab = None
++        if args.view == 'lab':
++            if args.display_mode != 'immersive':
++                logger_mp.warning("--view lab needs --display-mode immersive: using the camera image")
++            elif 'lab' not in camera_config or not (os.path.isfile(R1_MODEL_URDF) and os.path.isfile(R1_VR_MESHES)):
++                logger_mp.warning("--view lab needs the r1_sim simulator (its lab layout) and the R1 model in the image: using the camera image")
++            else:
++                from televuer.lab_view import LabScene
++                description = dict(camera_config['lab'])
++                if args.passthrough:
++                    description["boxes"] = [b for b in description["boxes"]
++                                            if not b["name"].startswith(("room", "wall", "ceiling", "floor"))]
++                LabScene(description, R1_MODEL_URDF, R1_VR_MESHES)
++                lab = {"description": description, "urdf": R1_MODEL_URDF, "meshes": R1_VR_MESHES,
++                       "state_url": f"tcp://{args.img_server_ip}:{camera_config['lab']['state_port']}",
++                       "show_hands": bool(args.show_hands), "fps": args.lab_fps}
++        robot_root = pose_from_xyzw(camera_config['lab']['robot_root']) if 'lab' in camera_config else np.array(
++            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.75], [0.0, 0.0, 0.0, 1.0]])
++        geometry = RobotGeometry(R1_MODEL_URDF, head_cam.get('mount_xyz', [0.095, 0.0, 0.0])) if os.path.isfile(R1_MODEL_URDF) else None
++        lab_poses = None
++        if args.whole_body:
++            problem = ("the simulator's pelvis is fixed (start r1_sim with SIM_LOCOMOTION=1)" if not camera_config.get('lab', {}).get('floating_base')
++                       else "--arm R1_A5" if args.arm != "R1_A5" else "--hand-mapping exact" if args.hand_mapping != "exact" or geometry is None
++                       else "--input-mode hand" if args.input_mode != "hand" else None)
++            if problem:
++                logger_mp.warning(f"--whole-body needs {problem}: the robot's legs stay where they are")
++                args.whole_body = 0
++            else:
++                args.motion = True
++                lab_poses = LabPoses(f"tcp://{args.img_server_ip}:{camera_config['lab']['state_port']}")
++        if args.hand_mapping == 'exact' and geometry is None:
++            logger_mp.warning(f"--hand-mapping exact needs {R1_MODEL_URDF}: using relative")
++            args.hand_mapping, args.relative = 'relative', True
++        view = None
++        if args.immersive_view and args.display_mode == 'immersive' and lab is None:
++            if cam_vfov is None:
++                logger_mp.warning("immersive view needs the head camera's field of view (--head-cam-vfov): using the upstream view")
++            else:
++                view = {"vfov_deg": float(cam_vfov), "distance": 2.0 if head_cam['binocular'] else 1.0,
++                        "ipd": 0.064, "world_locked": True}
+ 
+         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
+         tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
+@@ -135,7 +893,8 @@
+                                      zmq=camera_config['head_camera']['enable_zmq'],
+                                      webrtc=camera_config['head_camera']['enable_webrtc'],
+                                      webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
+-                                     arm_reference_mode="head_yaw"
++                                     arm_reference_mode="head_yaw",
++                                     view=view, lab=lab,
+                                      )
+         
+         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
+@@ -179,8 +938,15 @@
+             arm_ik = H2_ArmIK()
+             arm_ctrl = H2_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+         elif args.arm == "R1_A5":
+-            arm_ik = R1_A5_ArmIK()
++            if args.hand_mapping == 'unitree' or geometry is None:
++                arm_ik = R1_A5_ArmIK()
++            else:
++                arm_ik = R1_A5_ArmIK(ee_placement=geometry.palm_in_wrist, cost_weights=(5000.0, 1.0, 0.02, 0.1), filter_weights=(1.0,))
++                reduced = arm_ik.reduced_robot.model
++                for side in ("left", "right"):
++                    reduced.inertias[reduced.getJointId(f"{side}_wrist_roll_joint")] = geometry.wrist_inertia[side]
+             arm_ctrl = R1_A5_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
++            body = BodyFollower(geometry, body=camera_config['lab'].get('body')) if args.whole_body else None
+         elif args.arm == "R1_A7":
+             arm_ik = R1_A7_ArmIK()
+             arm_ctrl = R1_A7_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+@@ -230,7 +996,8 @@
+             dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
+             dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
+             hand_ctrl = Brainco_Controller_hand(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
+-                                                dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
++                                                dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready,
++                                                finger_mapping=args.finger_mapping)
+         elif args.ee == "brainco" and args.input_mode == "controller":
+             from teleop.robot_control.robot_hand_brainco import Brainco_Controller_ctrl
+             left_gripper_trigger_in = Value('d', 10.0, lock=True)  # [input]
+@@ -262,20 +1029,330 @@
+                                      rerun_log = not args.headless)
+ 
+         logger_mp.info("----------------------------------------------------------------")
+-        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
++        logger_mp.info("🟢  Press [r] (or START in the headset) to start syncing the robot with your movements.")
++        if args.start_delay > 0 or args.wait_for_hands:
++            logger_mp.info(f"⏳  After [r]: {'the robot waits until the headset tracks both hands, then ' if args.wait_for_hands else ''}a {args.start_delay:g} s countdown in the headset to get into the start pose; the arms then blend in over {args.ramp_time:g} s.")
+         if args.record:
+-            logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
++            logger_mp.info("🟡  Press [s] (or REC in the headset) to START or SAVE recording (toggle cycle).")
+         else:
+             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
+         logger_mp.info("🔴  Press [q] to stop and exit the program.")
++        logger_mp.info("🔁  Press [c] to RESTART: get ready and GO again, which re-calibrates (the robot's eyes and hands to yours)"
++                       + (", [x] to RESET the scene (the robot and the objects back where they started)." if args.sim else "."))
+         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
+         READY = True                  # now ready to (1) enter START state
++        tvuer = tv_wrapper.tvuer
++        hand_watch = HandWatch(tvuer)
++        gate = TrackingGate(tvuer, hand_watch)
++        operator = OperatorFrame(tvuer)
++        if hasattr(arm_ctrl, "follow_speed_limit"):
++            arm_ctrl.follow_speed_limit = args.arm_speed_limit
++            arm_ctrl.follow_period = 1.0 / args.control_frequency
++        if lab is not None:
++            operator.world_scale = None if args.world_scale == 'auto' else float(args.world_scale)
++            operator.robot_eye_z = float((robot_root @ np.append(geometry.eye, 1.0))[2]) if geometry is not None else None
++        binocular = camera_config['head_camera']['binocular']
++        xr_need_local_img = xr_need_local_img and lab is None
++        follow_head = bool(args.head_tracking) and hasattr(arm_ctrl, "ctrl_head")
++        if args.head_tracking and not follow_head:
++            logger_mp.warning(f"--head-tracking: {args.arm} has no head joints to move")
++        if lab is not None:
++            logger_mp.info("🧪  lab view: the headset draws the simulated lab around you; at GO the robot's eyes are put where yours are"
++                           + ("; pass-through: only the robot, tables and objects are drawn, in your real room - press "
++                              "'Pass-through' in the browser" if args.passthrough else ""))
++        elif view is not None:
++            logger_mp.info(f"👀  immersive view: {'one image per eye, ' if binocular else ''}life-size ({cam_vfov:g} deg tall), "
++                           "fixed in the room where the robot's camera looked")
++        if follow_head:
++            logger_mp.info("🙂  the robot's head turns where you look as soon as the headset is in VR")
++        if args.whole_body:
++            logger_mp.info("🚶  whole body: from GO the robot walks where you walk, turns where you turn, squats and leans "
++                           "with you (and to reach your hands); arms on rt/arm_sdk, body on rt/sim/body_cmd - "
++                           + ("its pelvis is placed exactly (pose)" if body is not None and body.pose_mode else
++                              "the simulator's leg controller balances it (velocity)"))
++        else:
++            body = None
++        mapping_text = {"exact": "the robot's palms go where your palms are", "unitree": "Unitree's absolute mapping",
++                        "relative": "the robot's hands copy your hand movements from where both are at GO"}
++        logger_mp.info(f"✋  hand mapping {args.hand_mapping}: {mapping_text[args.hand_mapping]}; fingers: {args.finger_mapping}")
++        if args.vr_buttons:
++            logger_mp.info("🔘  buttons in the headset (on your left, top to bottom): EXIT = [q]" + (", RESET = [x]" if args.sim else "")
++                           + ", RESTART = [c], START = [r], REC = [s]" + ("" if args.record else " (needs --record)")
++                           + "; press them with a fingertip (RESET and EXIT: twice)")
++        status = {"printed": 0.0, "reason": "start"}
++        perf = {"n": 0, "work": 0.0, "ik": 0.0, "age": 0.0, "since": time.time()}
++        def root_now():
++            return lab_poses.root if lab_poses is not None and lab_poses.root is not None else robot_root
++        def eye_now():
++            return (root_now() @ np.append(geometry.eye, 1.0))[:3] if geometry is not None else np.array([0.1225, 0.0, 1.1705])
++        def sim_ik_now():
++            placed_pelvis = body.pelvis() if body is not None else None
++            T = (placed_pelvis if placed_pelvis is not None else root_now()).copy()
++            if geometry is not None:
++                T[:3, 3] += T[:3, :3] @ geometry.ik_origin
++            return T
++        eye_sim = eye_now()
++        buttons = VRButtons([name for name in VRButtons.ANCHORS if args.sim or name != "reset"])
++        placed = {"version": -1, "board": None, "T": None, "yaw0": 0.0}
++        board = {"lines": None, "until": 0.0}
++        rec_since = [None]
++        jumps_seen = [lab_poses.jumps if lab_poses is not None else 0]
++
++        def update_view(now):
++            operator.update(now, gate.in_vr(now))
++            if follow_head and operator.gaze() is not None:
++                gaze = operator.gaze()
++                if body is not None:
++                    gaze = rot_z(-(yaw_of(root_now()[:3, :3]) - placed["yaw0"])) @ gaze
++                arm_ctrl.ctrl_head(head_joints_for(gaze, cam_pitch), args.head_speed_limit)
++            if operator.heading is not None and operator.version != placed["version"]:
++                placed["version"] = operator.version
++                eye_sim[:] = eye_now()
++                placed["yaw0"] = yaw_of(root_now()[:3, :3])
++                T = operator.placement(eye_sim, placed["yaw0"])
++                placed["T"] = T
++                if lab is not None:
++                    logger_mp.info(f"📏  world scale {operator.scale:.2f}: your eyes are {operator.eye_xr[1]:.2f} m above the floor")
++                tvuer.set_lab_placement(T)
++                buttons.place(T, eye_sim)
++                placed["board"] = to_room(T, panel_pose(np.array(BOARD_ANCHOR), eye_sim))
++                if lab is not None and lab["description"].get("scene") == "assembly":
++                    placed["board2"] = to_room(T, panel_pose(np.array(SIDE_BOARD_ANCHOR), eye_sim))
++
++        def show(teleimage, lines=None):
++            bgr, head_q = decode_head_frame(teleimage)
++            if bgr is None:
++                return
++            if head_q is None and hasattr(arm_ctrl, "get_current_head_q"):
++                head_q = arm_ctrl.get_current_head_q()
++            rotation = None
++            if view is not None and operator.heading is not None:
++                rotation = operator.to_openxr(camera_rotation(head_q if head_q is not None else np.zeros(2), cam_pitch))
++            tvuer.render_to_xr(overlay_text(bgr, lines, binocular) if lines else bgr, rotation)
++
++        def tell(now, lines, teleimage=None):
++            if board["lines"] and now < board["until"]:
++                lines = board["lines"]
++            if xr_need_local_img and teleimage is not None:
++                show(teleimage, lines)
++            if placed["board"] is None:
++                return
++            panels = []
++            if args.vr_buttons:
++                panels += buttons.panels(now, button_labels(now, buttons.armed, START, args.record, RECORD_RUNNING,
++                                                            now - (rec_since[0] or now)))
++            if lab is not None and lines:
++                for key in ("board", "board2"):
++                    if placed.get(key) is not None:
++                        panels.append({"key": f"ui-{key}", "size": list(BOARD_SIZE), "matrix": placed[key].flatten(order="F").tolist(),
++                                       "bg": [28, 32, 40], "fg": [255, 255, 255], "border": [90, 96, 110],
++                                       "lines": [list(l) for l in lines]})
++            tvuer.set_ui(panels)
++
++        def pressed(now):
++            if not args.vr_buttons or not buttons.poses:
++                return []
++            tips = [tvuer.left_hand_positions[9], tvuer.right_hand_positions[9]] if hand_watch.tracked(now) else []
++            names = buttons.step(now, tips)
++            for name in names:
++                logger_mp.info(f"🔘  {name.upper()} pressed in the headset")
++            return names
++
++        def report(now, ok, reason, running):
++            if reason != status["reason"] and reason != "settling":
++                status["reason"] = reason
++                if reason is None or ok:
++                    logger_mp.info("✋  hand tracking: both hands tracked" + (" - the robot follows" if running else ""))
++                else:
++                    logger_mp.warning(f"✋  {reason}" + (" - holding the arms" if running else " - the robot will not follow"))
++            if now - status["printed"] >= 10.0:
++                status["printed"] = now
++                logger_mp.info(f"📡  headset {'in VR' if gate.in_vr(now) else 'NOT in VR'} | hands "
++                               f"{'tracked' if hand_watch.tracked(now) else 'not tracked'} ({hand_watch.rate(now):.0f} Hz) | "
++                               f"controllers {'IN USE' if gate.controllers_in_use(now) else 'not in use'} | robot "
++                               f"{('following' if ok else 'holding') if running else 'getting ready for GO' if START else 'waiting for START / [r]'}"
++                               + (" | head follows you" if follow_head and operator.heading is not None else ""))
++                if perf["n"]:
++                    n = perf["n"]
++                    logger_mp.info(f"⏱️  control {n / max(now - perf['since'], 1e-3):.0f} Hz: a cycle's work {perf['work'] / n * 1000:.1f} ms "
++                                   f"(IK {perf['ik'] / n * 1000:.1f} ms), hand poses {perf['age'] / n * 1000:.0f} ms old when used")
++                perf.update(n=0, work=0.0, ik=0.0, age=0.0, since=now)
++
++        def rec_off_hint(now):
++            board.update(lines=[("RECORDING IS OFF", 0.8), ("start teleop with --record", 0.45)], until=now + 3.0)
++
++        WALK_BACK, STAND_TIMEOUT = 0.25, 5.0
++        ready_text = "stand up straight, look at the table" if body is not None else "look at the table"
++
++        def requests(now, phase):
++            global START, STOP, RECORD_TOGGLE, REQUEST
++            names = []
++            for name in pressed(now):
++                if name in VRButtons.CONFIRMED:
++                    if not buttons.confirm(now, name):
++                        board.update(lines=[(f"PRESS {name.upper()} AGAIN", 0.8), (CONFIRM_HINT[name], 0.45)],
++                                     until=now + VRButtons.CONFIRM)
++                        continue
++                    board.update(lines=None, until=0.0)
++                names.append(name)
++            if REQUEST is not None:
++                names.append(REQUEST)
++                REQUEST = None
++            out = []
++            for name in names:
++                if name == "exit":
++                    logger_mp.info("🔘  EXIT: the teleoperation ends (the arms return home first)")
++                    START, STOP = False, True
++                elif name == "start":
++                    if phase == "wait":
++                        START = True
++                elif name == "rec":
++                    if not args.record:
++                        rec_off_hint(now)
++                    elif phase == "run":
++                        RECORD_TOGGLE = True
++                    else:
++                        board.update(lines=[("PRESS START FIRST" if phase == "wait" else "REC AFTER GO", 0.8)], until=now + 2.0)
++                elif name == "restart" and phase == "wait":
++                    board.update(lines=[("PRESS START FIRST", 0.8)], until=now + 2.0)
++                elif name == "reset" and not args.sim:
++                    logger_mp.warning("RESET needs the simulator (--sim)")
++                elif name not in out:
++                    out.append(name)
++            return out
++
++        def save_recording(why):
++            global RECORD_RUNNING
++            if args.record and RECORD_RUNNING:
++                RECORD_RUNNING = False
++                recorder.save_episode()
++                logger_mp.info(f"💾  {why}: the episode recorded so far is saved")
++
++        def glide_home():
++            global cmd_q, cmd_tau, cmd_time
++            q0, tau0 = float(np.max(np.abs(cmd_q))), cmd_tau.copy()
++            step = args.arm_speed_limit * 0.02 if args.arm_speed_limit > 0 else np.inf
++            while float(np.max(np.abs(cmd_q))) > 1e-3:
++                cmd_q = cmd_q - np.clip(cmd_q, -step, step)
++                cmd_tau = tau0 * (float(np.max(np.abs(cmd_q))) / max(q0, 1e-9))
++                arm_ctrl.ctrl_dual_arm(cmd_q, cmd_tau)
++                time.sleep(0.02)
++            cmd_q, cmd_tau, cmd_time = np.zeros_like(cmd_q), np.zeros_like(cmd_tau), time.time()
++            arm_ctrl.ctrl_dual_arm(cmd_q, cmd_tau)
++
++        def reset_scene():
++            save_recording("RESET")
++            if body is not None and body.active:
++                body.stand()
++            if 'cmd_q' in globals():
++                glide_home()
++            publish_reset_category(2, reset_pose_publisher)
++            logger_mp.info("🔄  RESET: the robot and every object go back where they started")
++
++        def robot_was_reset():
++            global cmd_q, cmd_tau, cmd_time
++            jumps_seen[0] = lab_poses.jumps
++            logger_mp.warning("🔄  the simulator put the robot back at its start")
++            if 'cmd_q' in globals():
++                cmd_q, cmd_tau, cmd_time = np.zeros_like(cmd_q), np.zeros_like(cmd_tau), time.time()
++                arm_ctrl.ctrl_dual_arm(cmd_q, cmd_tau)
++
++        def robot_distance(now):
++            if placed["T"] is None or not gate.in_vr(now):
++                return np.inf
++            head_sim = np.linalg.inv(placed["T"]) @ tvuer.head_pose
++            return float(np.linalg.norm(head_sim[:2, 3] - eye_now()[:2]))
++
++        def calibrate_go():
++            now = time.time()
++            if (args.hand_mapping == "exact" or lab is not None) and operator.calibrate(now):
++                update_view(now)
++            if body is not None:
++                head_sim = (from_room(placed["T"], tvuer.head_pose @ T_OPENXR_ROBOT)
++                            if placed["T"] is not None and gate.in_vr(now) else None)
++                body.start(root_now(), eye_sim[2], lab_poses.stance, head=head_sim, scale=operator.scale)
++                jumps_seen[0] = lab_poses.jumps
++
++        def get_ready(title, walk_back=False):
++            waits = args.start_delay > 0 or args.wait_for_hands or walk_back or body is not None
++            countdown_end, t0 = None, time.time()
++            quiet_until = t0 + (0.5 if walk_back else 0.0)
++            stand_warned = False
++            while waits and not STOP:
++                time.sleep(0.033)
++                now = time.time()
++                update_view(now)
++                hands_ok, reason = gate.check(now)
++                for name in requests(now, "ready"):
++                    if name == "reset":
++                        reset_scene()
++                        title, walk_back = "SCENE RESET", body is not None and 'cmd_q' in globals()
++                    else:
++                        title, walk_back = "RESTART", False
++                    countdown_end, t0 = None, time.time()
++                    quiet_until = t0 + (0.5 if name == "reset" else 0.0)
++                if body is not None and lab_poses.jumps != jumps_seen[0]:
++                    robot_was_reset()
++                    walk_back = walk_back or 'cmd_q' in globals()
++                    title = title if title == "SCENE RESET" else "ROBOT RESET"
++                    countdown_end, t0 = None, time.time()
++                if STOP:
++                    break
++                if body is not None:
++                    body.stand_up(lab_poses.root)
++                if hands_ok and buttons.near:
++                    hands_ok, reason = False, "using a button"
++                report(now, hands_ok, None if hands_ok else reason, False)
++                distance = robot_distance(now) if walk_back else 0.0
++                upright = body is None or (lab_poses.fresh(now) and body.upright(lab_poses.root))
++                if now < quiet_until:
++                    countdown_end, lines = None, [(title, 1.0)]
++                elif distance > WALK_BACK:
++                    countdown_end = None
++                    lines = [(title, 0.8), ("STEP BACK INTO THE ROBOT", 0.65),
++                             (f"{distance:.1f} m away - or press RESTART to start here", 0.38)] if np.isfinite(distance) else message_for(reason, False)
++                elif not upright and now - t0 < STAND_TIMEOUT:
++                    countdown_end, lines = None, [(title, 0.8), ("THE ROBOT STANDS UP", 0.65)]
++                elif args.wait_for_hands and not hands_ok:
++                    if countdown_end is not None:
++                        logger_mp.warning("✋  the countdown restarts when both hands are tracked again")
++                    countdown_end, lines = None, message_for(reason, False)
++                else:
++                    if not upright and not stand_warned:
++                        stand_warned = True
++                        logger_mp.warning(f"🚶  the robot did not stand up straight within {STAND_TIMEOUT:g} s: GO anyway")
++                    if countdown_end is None:
++                        countdown_end = now + args.start_delay
++                    if now >= countdown_end:
++                        break
++                    lines = [(title, 1.0), (str(max(1, int(np.ceil(countdown_end - now)))), 2.5), (ready_text, 0.42)]
++                frame = img_client.get_head_frame() if camera_config['head_camera']['enable_zmq'] and xr_need_local_img else None
++                tell(now, lines, frame)
++            if STOP:
++                return False
++            calibrate_go()
++            return True
++
+         while not START and not STOP: # wait for start or stop signal.
+             time.sleep(0.033)
+-            if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+-                head_img = img_client.get_head_frame()
+-                if head_img.bgr is not None:
+-                    tv_wrapper.render_to_xr(head_img.bgr)
++            now = time.time()
++            update_view(now)
++            hands_ok, reason = gate.check(now)
++            report(now, hands_ok, None if hands_ok else reason, False)
++            if "reset" in requests(now, "wait"):
++                reset_scene()
++                board.update(lines=[("SCENE RESET", 1.0)], until=time.time() + 1.5)
++            if args.wait_for_hands and not hands_ok and reason != "settling":
++                lines = message_for(reason, False)
++            else:
++                lines = [("PRESS START", 1.0), ("green button on your left - or key [r]", 0.42)] if args.vr_buttons else None
++            frame = img_client.get_head_frame() if camera_config['head_camera']['enable_zmq'] and xr_need_local_img else None
++            tell(now, lines, frame)
++
++        if not STOP:
++            if args.start_delay > 0 or args.wait_for_hands:
++                logger_mp.info(f"⏳  started - the robot follows you {args.start_delay:g} s after both hands are tracked: get into the start pose.")
++            get_ready("GET READY" if args.hand_mapping != "unitree" else "START POSE")
+ 
+         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
+ 
+@@ -283,15 +1360,98 @@
+         left_wrist_img = None
+         right_wrist_img = None
+ 
++        go_time = time.time()
++        go_banner_until = go_time + 0.8 if (args.start_delay > 0 or args.wait_for_hands) else go_time
++        ramp_q0 = arm_ctrl.get_current_dual_arm_q()
++        cmd_q, cmd_time, cmd_tau = ramp_q0.copy(), go_time, np.zeros_like(ramp_q0)
++        record_every = max(1, int(round(args.control_frequency / args.frequency)))
++        cycle = 0
++        hands_was = True
++        palm_filters = [OneEuroPose(), OneEuroPose()]
++        palms = [OperatorPalm(), OperatorPalm()]
++        far = [False, False]
++        if args.hand_mapping != "unitree":
++            import pinocchio as pin
++            ik_model = arm_ik.reduced_robot.model
++            ik_data = ik_model.createData()
++            def ee_poses(q):
++                pin.framesForwardKinematics(ik_model, ik_data, q)
++                return [ik_data.oMf[i].homogeneous.copy() for i in (arm_ik.L_hand_id, arm_ik.R_hand_id)]
++            def operator_palms(now):
++                T = placed["T"] if placed["T"] is not None else operator.placement(eye_sim)
++                return [from_room(T, f(palm(P, W, now), now)) for f, palm, P, W in
++                        zip(palm_filters, palms, (tvuer.left_hand_positions, tvuer.right_hand_positions),
++                            (tvuer.left_arm_pose, tvuer.right_arm_pose))]
++            def ik_targets(in_sim):
++                T_ik = sim_ik_now()
++                if body is not None:
++                    arm_ik.reduced_robot.model.gravity.linear = T_ik[:3, :3].T @ np.array([0.0, 0.0, -9.81])
++                to_ik = np.linalg.inv(T_ik)
++                return [to_ik @ P for P in in_sim]
++            if args.relative:
++                logger_mp.info("🤝  relative mode: the robot's hands copy your hand movements from where both are now")
++        rel_anchor = rel_prev = None
++        rel_version = operator.version
++
+         # main loop. robot start to follow VR user's motion
+         while not STOP:
++            cycle += 1
+             start_time = time.time()
++            palms_sim = None
++            update_view(start_time)
++            hands_ok, reason = gate.check(start_time)
++            hands_ok = hands_ok or not args.wait_for_hands
++            todo = requests(start_time, "run")
++            jumped = body is not None and lab_poses.jumps != jumps_seen[0]
++            if STOP:
++                continue
++            if todo or jumped:
++                if "reset" in todo:
++                    reset_scene()
++                    title = "SCENE RESET"
++                else:
++                    save_recording("RESTART" if todo else "robot reset")
++                    title = "RESTART" if todo else "ROBOT RESET"
++                    if body is not None:
++                        body.stand()
++                if jumped:
++                    robot_was_reset()
++                logger_mp.info(f"🔁  {title}: the robot holds until GO - " + ("step back into the robot, then " if body is not None and title != "RESTART" else "")
++                               + "get ready (the robot's eyes and hands are put on yours again at GO)")
++                if not get_ready(title, walk_back=body is not None and title != "RESTART"):
++                    continue
++                go_time = cmd_time = time.time()
++                go_banner_until = go_time + 0.8 if (args.start_delay > 0 or args.wait_for_hands) else go_time
++                ramp_q0, rel_anchor, rel_version, hands_was = cmd_q.copy(), None, operator.version, True
++                for f in palm_filters:
++                    f.reset()
++                palms[:] = [OperatorPalm(), OperatorPalm()]
++                far[:] = [False, False]
++                logger_mp.info("🚀  GO: the robot follows you again")
++                continue
++            if hands_ok and buttons.near:
++                hands_ok, reason = False, "using a button"
++            report(start_time, hands_ok, None if hands_ok else reason, True)
++            if hands_ok != hands_was:
++                hands_was = hands_ok
++                if hands_ok:
++                    go_time, ramp_q0, rel_anchor = start_time, cmd_q.copy(), None
++                    for f in palm_filters:
++                        f.reset()
++            if operator.version != rel_version:
++                rel_version, rel_anchor = operator.version, None
++                go_time, ramp_q0 = start_time, cmd_q.copy()
+             # get image
+             if camera_config['head_camera']['enable_zmq']:
+                 if args.record or xr_need_local_img:
+                     head_img = img_client.get_head_frame()
+-                if xr_need_local_img and head_img.bgr is not None:
+-                    tv_wrapper.render_to_xr(head_img.bgr)
++            if not hands_ok:
++                lines = message_for(reason, True)
++            elif start_time < go_banner_until:
++                lines = [("GO", 2.5)]
++            else:
++                lines = [(f"{side.upper()} HAND OUT OF THE ROBOT'S REACH", 0.5) for side, f in zip(("left", "right"), far) if f] or None
++            tell(start_time, lines, head_img)
+             if camera_config['left_wrist_camera']['enable_zmq']:
+                 if args.record:
+                     left_wrist_img = img_client.get_left_wrist_frame()
+@@ -305,6 +1465,7 @@
+                 if not RECORD_RUNNING:
+                     if recorder.create_episode():
+                         RECORD_RUNNING = True
++                        rec_since[0] = time.time()
+                     else:
+                         logger_mp.error("Failed to create episode. Recording not started.")
+                 else:
+@@ -343,7 +1504,7 @@
+                 pass
+             with xr_motion_data_ready.get_lock():
+                 xr_motion_data_ready.value = tele_data.motion_data_ready
+-            
++
+             # high level control
+             if args.input_mode == "controller" and args.motion:
+                 # quit teleoperate
+@@ -363,11 +1524,55 @@
+             current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
+ 
+             # solve ik using motor data and wrist pose, then use ik results to control arms.
+-            time_ik_start = time.time()
+-            sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
+-            time_ik_end = time.time()
+-            logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
+-            arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
++            if body is not None and lab_poses.jumps != jumps_seen[0]:
++                hands_ok = False
++            if hands_ok:
++                left_wrist, right_wrist = tele_data.left_wrist_pose, tele_data.right_wrist_pose
++                if args.hand_mapping != "unitree" and operator.heading is not None:
++                    palms_sim = operator_palms(start_time)
++                if args.wait_for_hands and not gate.check(time.time())[0]:
++                    hands_ok, rel_anchor = False, None
++            if body is not None:
++                if hands_ok and placed["T"] is not None and lab_poses.fresh(start_time) and gate.in_vr(start_time):
++                    head_sim = from_room(placed["T"], tvuer.head_pose @ T_OPENXR_ROBOT)
++                    body.step(start_time, head_sim, palms_sim, lab_poses.root, True, lab_poses.stance)
++                else:
++                    body.stand()
++            if hands_ok and palms_sim is not None:
++                human = ik_targets(palms_sim)
++                if args.hand_mapping == "exact":
++                    left_wrist, right_wrist = human
++                else:
++                    robot_now = ee_poses(cmd_q)
++                    if rel_anchor is None:
++                        rel_anchor, rel_prev = (robot_now, human), human
++                    left_wrist, right_wrist = (relative_target(r0, h0, h, rn, hp) for r0, h0, h, rn, hp in
++                                               zip(rel_anchor[0], rel_anchor[1], human, robot_now, rel_prev))
++                    rel_prev = human
++            if hands_ok:
++                time_ik_start = time.time()
++                sol_q, sol_tauff  = arm_ik.solve_ik(left_wrist, right_wrist, current_lr_arm_q, current_lr_arm_dq)
++                time_ik_end = time.time()
++                logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
++                perf["ik"] += time_ik_end - time_ik_start
++                perf["age"] += time_ik_start - tvuer.hands_time
++                perf["n"] += 1
++                if args.hand_mapping == "exact":
++                    reached = ee_poses(sol_q)
++                    for k, (ee, target) in enumerate(zip(reached, (left_wrist, right_wrist))):
++                        miss = float(np.linalg.norm(ee[:3, 3] - target[:3, 3]))
++                        far[k] = miss > (0.03 if far[k] else 0.05)
++                now = time.time()
++                alpha = 1.0 if args.ramp_time <= 0 else min(1.0, (now - go_time) / args.ramp_time)
++                sol_q = ramp_q0 + alpha * alpha * (3.0 - 2.0 * alpha) * (sol_q - ramp_q0)
++                if args.arm_speed_limit > 0:
++                    delta = sol_q - cmd_q
++                    max_step = args.arm_speed_limit * min(max(now - cmd_time, 1e-3), 0.05)
++                    sol_q = cmd_q + delta / max(1.0, float(np.max(np.abs(delta))) / max_step)
++            else:
++                now, sol_q, sol_tauff = time.time(), cmd_q, cmd_tau
++            cmd_q, cmd_time, cmd_tau = sol_q, now, sol_tauff
++            arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff, follow=args.sim)
+ 
+             # record data
+             if args.record:
+@@ -424,12 +1629,15 @@
+                     right_hand_action = []
+                     current_body_state = []
+                     current_body_action = []
++                if body is not None:
++                    current_body_state = arm_ctrl.get_current_motor_q().tolist()
++                    current_body_action = list(body.command)
+ 
+                 # arm state and action (split into left/right halves by the arm's own DOF, so it works for any variant: H1/G1_23/R1_A5 = 4/5 per arm, G1_29/R1_A7 = 7)
+                 half = len(current_lr_arm_q) // 2
+                 left_arm_state,  right_arm_state  = current_lr_arm_q[:half], current_lr_arm_q[half:]
+                 left_arm_action, right_arm_action = sol_q[:half], sol_q[half:]
+-                if RECORD_RUNNING:
++                if RECORD_RUNNING and cycle % record_every == 0:
+                     colors = {}
+                     depths = {}
+                     if camera_config['head_camera']['binocular']:
+@@ -521,7 +1729,8 @@
+ 
+             current_time = time.time()
+             time_elapsed = current_time - start_time
+-            sleep_time = max(0, (1 / args.frequency) - time_elapsed)
++            perf["work"] += time_elapsed
++            sleep_time = max(0, (1 / args.control_frequency) - time_elapsed)
+             time.sleep(sleep_time)
+             logger_mp.debug(f"main process sleep: {sleep_time}")
+ 
+@@ -531,6 +1740,26 @@
+         import traceback
+         logger_mp.error(traceback.format_exc())
+     finally:
++        ended_at = None
++        try:
++            if 'tvuer' in globals() and abs(np.linalg.det(tvuer.head_pose[:3, :3])) > 0.5:
++                tvuer.set_ui([ended_panel(tvuer.head_pose)])
++                ended_at = time.time()
++            if globals().get('body') is not None and body.active:
++                body.stand()
++        except Exception as e:
++            logger_mp.error(f"Failed to show the end in the headset: {e}")
++        try:
++            if 'follow_head' in globals() and follow_head:
++                arm_ctrl.ctrl_head(np.zeros(2), args.head_speed_limit)
++            if args.arm_speed_limit > 0 and 'cmd_q' in globals():
++                step = args.arm_speed_limit * 0.02
++                while float(np.max(np.abs(cmd_q))) > 1e-3:
++                    cmd_q = cmd_q - np.clip(cmd_q, -step, step)
++                    arm_ctrl.ctrl_dual_arm(cmd_q, cmd_tau)
++                    time.sleep(0.02)
++        except Exception as e:
++            logger_mp.error(f"Failed to glide home: {e}")
+         try:
+             arm_ctrl.ctrl_dual_arm_go_home()
+         except Exception as e:
+@@ -552,6 +1781,8 @@
+             logger_mp.error(f"Failed to close image client: {e}")
+ 
+         try:
++            if ended_at is not None:
++                time.sleep(max(0.0, ended_at + 0.6 - time.time()))
+             tv_wrapper.close()
+         except Exception as e:
+             logger_mp.error(f"Failed to close televuer wrapper: {e}")
+--- a/teleop/robot_control/robot_arm.py
++++ b/teleop/robot_control/robot_arm.py
+@@ -1695,6 +1695,12 @@
+         logger_mp.info("Initialize R1_A5_ArmController...")
+         self.q_target = np.zeros(10)
+         self.tauff_target = np.zeros(10)
++        self.follow = False
++        self.q_stamp = time.time()
++        self.q_out = np.zeros(10)
++        self.q_from = np.zeros(10)
++        self.follow_speed_limit = 5.0
++        self.follow_period = 1.0 / 60.0
+         self.motion_mode = motion_mode
+         self.simulation_mode = simulation_mode
+         self.kp_high = 200.0
+@@ -1707,6 +1713,12 @@
+         self.kd_wrist = 2.0
+         self.kp_head = 15.0
+         self.kd_head = 1.0
++        if simulation_mode:
++            self.kp_low, self.kd_low = 100.0, 8.0
++            self.kp_medium, self.kd_medium = 80.0, 3.8
++            self.kp_wrist = 60.0
++        self.head_q_target = None
++        self.head_speed_limit = 3.0
+ 
+         self.all_motor_q = None
+         self.set_arm_velocity_limit()
+@@ -1786,10 +1798,12 @@
+ 
+         # Head and available waist joints gradually return to zero at startup.
+         self.ctrl_head_and_waist_go_home()
++        self.head_q_cmd = np.zeros(2)
+ 
+         # initialize publish thread
+         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
+         self.ctrl_lock = threading.Lock()
++        self.msg_lock = threading.Lock()
+         self.publish_thread.daemon = True
+         self.publish_thread.start()
+ 
+@@ -1805,11 +1819,13 @@
+             return
+         steps = max(1, int(duration / self.control_dt))
+         for weight in np.linspace(self.msg.mode_pr / 100.0, 0.0, num=steps + 1):
+-            self._set_arm_sdk_weight(weight)
+-            self.msg.crc = self.crc.Crc(self.msg)
+-            self.lowcmd_publisher.Write(self.msg)
++            with self.msg_lock:
++                self._set_arm_sdk_weight(weight)
++                self.msg.crc = self.crc.Crc(self.msg)
++                self.lowcmd_publisher.Write(self.msg)
+             time.sleep(self.control_dt)
+-        self._set_arm_sdk_weight(0.0)
++        with self.msg_lock:
++            self._set_arm_sdk_weight(0.0)
+ 
+     def _subscribe_motor_state(self):
+         while True:
+@@ -1861,30 +1877,63 @@
+             with self.ctrl_lock:
+                 arm_q_target     = self.q_target
+                 arm_tauff_target = self.tauff_target
++                head_q_target    = self.head_q_target
++                follow, q_from   = self.follow, self.q_from
++                q_age            = time.time() - self.q_stamp
+ 
++            arm_dq_target = np.zeros(10)
+             if self.simulation_mode:
+-                cliped_arm_q_target = arm_q_target
++                if not follow:
++                    self.q_out = np.array(arm_q_target, dtype=float)
++                else:
++                    s = min(1.0, q_age / self.follow_period)
++                    want = q_from + s * (arm_q_target - q_from)
++                    if s < 1.0:
++                        arm_dq_target = (arm_q_target - q_from) / self.follow_period
++                    step = self.follow_speed_limit * self.control_dt if self.follow_speed_limit > 0 else np.inf
++                    self.q_out = self.q_out + np.clip(want - self.q_out, -step, step)
++                    if self.follow_speed_limit > 0:
++                        arm_dq_target = np.clip(arm_dq_target, -self.follow_speed_limit, self.follow_speed_limit)
++                cliped_arm_q_target = self.q_out
+             else:
+                 cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
+ 
+-            for idx, id in enumerate(R1_A5_JointArmIndex):
+-                self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
+-                self.msg.motor_cmd[id].dq = 0
+-                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
++            with self.msg_lock:
++                if head_q_target is not None:
++                    step = self.head_speed_limit * self.control_dt
++                    self.head_q_cmd = self.head_q_cmd + np.clip(head_q_target - self.head_q_cmd, -step, step)
++                    for idx, id in enumerate(R1_A5_JointHeadIndex):
++                        self.msg.motor_cmd[id].q = float(self.head_q_cmd[idx])
++
++                for idx, id in enumerate(R1_A5_JointArmIndex):
++                    self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
++                    self.msg.motor_cmd[id].dq = float(arm_dq_target[idx])
++                    self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
+ 
+-            self.msg.crc = self.crc.Crc(self.msg)
+-            self.lowcmd_publisher.Write(self.msg)
++                self.msg.crc = self.crc.Crc(self.msg)
++                self.lowcmd_publisher.Write(self.msg)
+ 
+             current_time = time.time()
+             all_t_elapsed = current_time - start_time
+             sleep_time = max(0, (self.control_dt - all_t_elapsed))
+             time.sleep(sleep_time)
+ 
+-    def ctrl_dual_arm(self, q_target, tauff_target):
+-        '''Set control target values q & tau of the left and right arm motors.'''
++    def ctrl_dual_arm(self, q_target, tauff_target, follow=False):
+         with self.ctrl_lock:
++            self.q_from = self.q_out.copy()
+             self.q_target = q_target
+             self.tauff_target = tauff_target
++            self.follow = bool(follow)
++            self.q_stamp = time.time()
++
++    def ctrl_head(self, q_target, speed_limit=None):
++        with self.ctrl_lock:
++            self.head_q_target = np.asarray(q_target, dtype=float).copy()
++            if speed_limit is not None:
++                self.head_speed_limit = float(speed_limit)
++
++    def get_head_command_q(self):
++        return self.head_q_cmd.copy()
+ 
+     def get_mode_machine(self):
+         '''Return current dds mode machine.'''
+--- a/teleop/robot_control/robot_arm_ik.py
++++ b/teleop/robot_control/robot_arm_ik.py
+@@ -1487,7 +1487,8 @@
+             return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
+ 
+ class R1_A5_ArmIK:
+-    def __init__(self, Unit_Test = False, Visualization = False):
++    def __init__(self, Unit_Test = False, Visualization = False, ee_placement = None, cost_weights = (50.0, 0.5, 0.02, 0.1),
++                 filter_weights = (0.4, 0.3, 0.2, 0.1)):
+         np.set_printoptions(precision=5, suppress=True, linewidth=200)
+ 
+         self.Unit_Test = Unit_Test
+@@ -1543,6 +1544,11 @@
+                 self.save_cache()
+                 logger_mp.info(f">>> Cache saved to {self.cache_path}")
+ 
++        if ee_placement is not None:
++            for frame, side in (("L_ee", "left"), ("R_ee", "right")):
++                T = np.asarray(ee_placement[side], dtype=float)
++                self.reduced_robot.model.frames[self.reduced_robot.model.getFrameId(frame)].placement = pin.SE3(T[:3, :3], T[:3, 3])
++
+         # Creating Casadi models and data for symbolic computing
+         self.cmodel = cpin.Model(self.reduced_robot.model)
+         self.cdata = self.cmodel.createData()
+@@ -1595,7 +1601,8 @@
+             self.var_q,
+             self.reduced_robot.model.upperPositionLimit)
+         )
+-        self.opti.minimize(50 * self.translational_cost + 0.5 * self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
++        w_pos, w_rot, w_reg, w_smooth = cost_weights
++        self.opti.minimize(w_pos * self.translational_cost + w_rot * self.rotation_cost + w_reg * self.regularization_cost + w_smooth * self.smooth_cost)
+ 
+         opts = {
+             # CasADi-level options
+@@ -1618,7 +1625,7 @@
+         self.opti.solver("ipopt", opts)
+ 
+         self.init_data = np.zeros(self.reduced_robot.model.nq)
+-        self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), 10)
++        self.smooth_filter = WeightedMovingFilter(np.array(filter_weights), 10)
+         self.vis = None
+ 
+         if self.Visualization:
+@@ -2066,4 +2073,4 @@
+             step += 1
+             if step > 240:
+                 step = 0
+-            time.sleep(0.1)
+\ No newline at end of file
++            time.sleep(0.1)
+--- a/teleop/robot_control/robot_hand_brainco.py
++++ b/teleop/robot_control/robot_hand_brainco.py
+@@ -169,11 +169,93 @@
+             logger_mp.info("Brainco_Controller_ctrl has been closed.")
+ 
+ 
++WEBXR_FINGERS = {"index": (6, 7, 9), "middle": (11, 12, 14), "ring": (16, 17, 19), "pinky": (21, 22, 24)}
++BRAINCO_MOTORS = ("thumb_metacarpal", "thumb_proximal", "index_proximal", "middle_proximal", "ring_proximal", "pinky_proximal")
++BRAINCO_RANGES = (1.5184, 1.0472, 1.4661, 1.4661, 1.4661, 1.4661)
++BRAINCO_COUPLING = {"thumb_proximal": ("thumb_distal", 1.0), "index_proximal": ("index_distal", 1.155),
++                    "middle_proximal": ("middle_distal", 1.155), "ring_proximal": ("ring_distal", 1.155),
++                    "pinky_proximal": ("pinky_distal", 1.155)}
++
++def _angle(a, b):
++    na, nb = np.linalg.norm(a), np.linalg.norm(b)
++    if na < 1e-9 or nb < 1e-9:
++        return 0.0
++    return float(np.degrees(np.arccos(np.clip(a @ b / (na * nb), -1.0, 1.0))))
++
++def _palm_axes(wrist, middle, index, pinky, side):
++    f = middle - wrist
++    f = f / max(np.linalg.norm(f), 1e-9)
++    l = index - pinky
++    l = l - f * (f @ l)
++    l = l / max(np.linalg.norm(l), 1e-9)
++    n = np.cross(f, l)
++    return f, l, (n if side == "left" else -n)
++
++def hand_measures(p, side):
++    f, l, palmar = _palm_axes(p[0], p[11], p[6], p[21], side)
++    out = {}
++    for name, (mcp, pip, tip) in WEBXR_FINGERS.items():
++        out[name] = _angle(p[mcp] - p[0], p[pip] - p[mcp]) + _angle(p[pip] - p[mcp], p[tip] - p[pip])
++    meta, prox, dist = p[2] - p[1], p[3] - p[2], p[4] - p[3]
++    out["thumb_flex"] = _angle(meta, prox) + _angle(prox, dist)
++    out["thumb_swing"] = float(np.degrees(np.arctan2(meta @ palmar, meta @ l)))
++    return out
++
++class BraincoDirectMapping:
++    def __init__(self, urdf="/opt/r1_model/r1_brainco.urdf", samples=60):
++        import pinocchio as pin
++        model = pin.buildModelFromUrdf(urdf)
++        data = model.createData()
++        self.tables = {}
++        for side in ("left", "right"):
++            def idx(joint):
++                return model.joints[model.getJointId(f"{side}_{joint}_joint")].idx_q
++            def pos(link):
++                return data.oMf[model.getFrameId(f"{side}_{link}")].translation.copy()
++            def robot_hand():
++                p = np.zeros((25, 3))
++                p[0], p[1], p[2] = pos("hand_palm_link"), pos("thumb_metacarpal_link"), pos("thumb_proximal_link")
++                p[3], p[4] = pos("thumb_distal_link"), pos("thumb_tip_link")
++                for name, (mcp, pip, tip) in WEBXR_FINGERS.items():
++                    p[mcp], p[pip], p[tip] = pos(f"{name}_proximal_link"), pos(f"{name}_distal_link"), pos(f"{name}_tip_link")
++                return p
++            tables = []
++            for motor, top in zip(BRAINCO_MOTORS, BRAINCO_RANGES):
++                key = {"thumb_metacarpal": "thumb_swing", "thumb_proximal": "thumb_flex"}.get(motor, motor.split("_")[0])
++                qs, ms = np.linspace(0.0, top, samples), []
++                for q in qs:
++                    qq = pin.neutral(model)
++                    qq[idx(motor)] = q
++                    if motor in BRAINCO_COUPLING:
++                        coupled, ratio = BRAINCO_COUPLING[motor]
++                        qq[idx(coupled)] = ratio * q
++                    pin.framesForwardKinematics(model, data, qq)
++                    ms.append(hand_measures(robot_hand(), side)[key])
++                ms = np.maximum.accumulate(np.asarray(ms))
++                if ms[-1] - ms[0] < 10.0:
++                    raise ValueError(f"BraincoDirectMapping: {side} {motor} barely moves its {key} angle")
++                tables.append((key, ms, qs / top))
++            self.tables[side] = tables
++
++    def ranges(self, side):
++        return {key: (round(float(ms[0]), 1), round(float(ms[-1]), 1)) for key, ms, _ in self.tables[side]}
++
++    def __call__(self, positions, side):
++        m = hand_measures(np.asarray(positions, dtype=float).reshape(25, 3), side)
++        return np.array([np.interp(m[key], ms, norm) for key, ms, norm in self.tables[side]])
++
++
+ class Brainco_Controller_hand:
+     def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,
+-                       dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None):
++                       dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None,
++                       finger_mapping = "dexpilot", finger_smoothing = 0.35):
+         logger_mp.info("Initialize Brainco_Controller_hand...")
+         self.fps = fps
++        self.direct_mapping = BraincoDirectMapping() if finger_mapping == "direct" else None
++        self.finger_smoothing = float(finger_smoothing)
++        if self.direct_mapping is not None:
++            logger_mp.info(f"[Brainco_Controller_hand] direct finger mapping, robot hand angles (deg) at open..closed: "
++                           f"{self.direct_mapping.ranges('right')}")
+         self.hand_sub_ready = False
+         self.Unit_Test = Unit_Test
+         self.simulation_mode = simulation_mode
+@@ -280,7 +362,12 @@
+                 # Read left and right q_state from shared arrays
+                 state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
+ 
+-                if xr_motion_data_ready:
++                if xr_motion_data_ready and self.direct_mapping is not None:
++                    if np.any(left_hand_data) and np.any(right_hand_data):
++                        a = self.finger_smoothing
++                        left_q_target = (1.0 - a) * left_q_target + a * self.direct_mapping(left_hand_data, "left")
++                        right_q_target = (1.0 - a) * right_q_target + a * self.direct_mapping(right_hand_data, "right")
++                elif xr_motion_data_ready:
+                     ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
+                     ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
+ 
+@@ -343,4 +430,4 @@
+     kLeftHandIndex = 2
+     kLeftHandMiddle = 3
+     kLeftHandRing = 4
+-    kLeftHandPinky = 5
+\ No newline at end of file
++    kLeftHandPinky = 5

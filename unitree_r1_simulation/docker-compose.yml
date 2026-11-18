@@ -1,0 +1,180 @@
+name: unitree-r1
+
+x-dds-env: &dds-env
+  DDS_DOMAIN_ID: ${DDS_DOMAIN_ID:-1}
+  DDS_INTERFACE: ${DDS_INTERFACE:-lo}
+
+x-gpu: &gpu
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: all
+          capabilities: [gpu]
+
+services:
+  isaaclab-base:
+    image: unitree-r1/isaaclab-base:3.0.0-6f5972e
+    profiles: ["base"]
+    build:
+      context: https://github.com/isaac-sim/IsaacLab.git#6f5972e9ad9b2610bd6108030cc5d2909352ade0
+      dockerfile: docker/Dockerfile.base
+      args:
+        ISAACSIM_BASE_IMAGE_ARG: nvcr.io/nvidia/isaac-sim
+        ISAACSIM_VERSION_ARG: "6.1.0"
+        ISAACSIM_ROOT_PATH_ARG: /isaac-sim
+        ISAACLAB_PATH_ARG: /workspace/isaaclab
+        DOCKER_USER_HOME_ARG: /root
+        IMAGE_EXTRAS: ""
+
+  sim:
+    image: unitree-r1/sim:6.1.0
+    build:
+      context: .
+      dockerfile: docker/sim/Dockerfile
+      additional_contexts:
+        isaaclab_base: service:isaaclab-base
+    network_mode: host
+    shm_size: "2gb"
+    stdin_open: true
+    tty: true
+    environment:
+      <<: *dds-env
+      DISPLAY: ${DISPLAY:-}
+      QT_X11_NO_MITSHM: "1"
+      ACCEPT_EULA: "Y"
+      PRIVACY_CONSENT: "N"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+      SIM_HEADLESS: ${SIM_HEADLESS:-0}
+      SIM_LIVESTREAM: ${SIM_LIVESTREAM:-0}
+      SIM_STEREO: ${SIM_STEREO:-1}
+      SIM_CAM_WIDTH: ${SIM_CAM_WIDTH:-640}
+      SIM_CAM_HEIGHT: ${SIM_CAM_HEIGHT:-480}
+      SIM_CAM_PITCH_DEG: ${SIM_CAM_PITCH_DEG:-50}
+      SIM_CAM_VFOV_DEG: ${SIM_CAM_VFOV_DEG:-70}
+      SIM_ROOM: ${SIM_ROOM:-1}
+      SIM_SCENE: ${SIM_SCENE:-assembly}
+      SIM_LOCOMOTION: ${SIM_LOCOMOTION:-1}
+      SIM_BODY: ${SIM_BODY:-exact}
+      SIM_GRIP_ASSIST: ${SIM_GRIP_ASSIST:-1}
+      SIM_RENDER_HZ: ${SIM_RENDER_HZ:-0}
+      SIM_RTX: ${SIM_RTX:-}
+      SIM_EXTRA_ARGS: ${SIM_EXTRA_ARGS:-}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ./r1_sim:/workspace/r1_sim:ro
+      - is61-cache-kit:/isaac-sim/kit/cache
+      - is61-data-kit:/isaac-sim/kit/data
+      - is61-cache-ov:/root/.cache/ov
+      - is61-cache-gl:/root/.cache/nvidia/GLCache
+      - is61-cache-compute:/root/.nv/ComputeCache
+      - is61-logs:/root/.nvidia-omniverse/logs
+      - is61-carb-logs:/isaac-sim/kit/logs/Kit/Isaac-Sim
+      - is61-data:/root/.local/share/ov/data
+      - is61-r1-usd:/root/.cache/r1_sim
+    deploy: *gpu
+
+  teleop:
+    image: unitree-r1/teleop:2.3
+    build:
+      context: .
+      dockerfile: docker/teleop/Dockerfile
+    profiles: ["teleop"]
+    network_mode: host
+    shm_size: "1gb"
+    stdin_open: true
+    tty: true
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      <<: *dds-env
+      HOST_IP: ${HOST_IP:-}
+      TELEOP_RECORD: ${TELEOP_RECORD:-0}
+      TELEOP_TASK_NAME: ${TELEOP_TASK_NAME:-r1_pick_place}
+      TELEOP_DISPLAY_MODE: ${TELEOP_DISPLAY_MODE:-immersive}
+      TELEOP_WAIT_FOR_HANDS: ${TELEOP_WAIT_FOR_HANDS:-1}
+      TELEOP_START_DELAY: ${TELEOP_START_DELAY:-2}
+      TELEOP_VIEW: ${TELEOP_VIEW:-lab}
+      TELEOP_HAND_MAPPING: ${TELEOP_HAND_MAPPING:-exact}
+      TELEOP_FINGER_MAPPING: ${TELEOP_FINGER_MAPPING:-direct}
+      TELEOP_VR_BUTTONS: ${TELEOP_VR_BUTTONS:-1}
+      TELEOP_SHOW_HANDS: ${TELEOP_SHOW_HANDS:-1}
+      TELEOP_RAMP_TIME: ${TELEOP_RAMP_TIME:-1}
+      TELEOP_ARM_SPEED_LIMIT: ${TELEOP_ARM_SPEED_LIMIT:-10}
+      TELEOP_HEAD_TRACKING: ${TELEOP_HEAD_TRACKING:-1}
+      TELEOP_HEAD_SPEED_LIMIT: ${TELEOP_HEAD_SPEED_LIMIT:-3}
+      TELEOP_IMMERSIVE_VIEW: ${TELEOP_IMMERSIVE_VIEW:-1}
+      TELEOP_WHOLE_BODY: ${TELEOP_WHOLE_BODY:-1}
+      TELEOP_PASSTHROUGH: ${TELEOP_PASSTHROUGH:-1}
+      TELEOP_WORLD_SCALE: ${TELEOP_WORLD_SCALE:-auto}
+    volumes:
+      - ./certs:/certs:ro
+      - ./data:/data
+      - ./r1_sim:/opt/r1_sim:ro
+
+  ros2:
+    image: unitree-r1/ros2:humble
+    build:
+      context: .
+      dockerfile: docker/ros2/Dockerfile
+    profiles: ["ros2"]
+    network_mode: host
+    stdin_open: true
+    tty: true
+    environment:
+      <<: *dds-env
+      DISPLAY: ${DISPLAY:-}
+      QT_X11_NO_MITSHM: "1"
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+  train:
+    image: unitree-r1/sim:6.1.0
+    profiles: ["train"]
+    shm_size: "4gb"
+    working_dir: /opt/r1_train
+    entrypoint: ["/workspace/isaaclab/isaaclab.sh", "-p", "/opt/r1_train/r1_loco/train.py"]
+    environment:
+      ACCEPT_EULA: "Y"
+      PRIVACY_CONSENT: "N"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+    volumes:
+      - ./r1_sim:/workspace/r1_sim:ro
+      - ./r1_loco:/opt/r1_train/r1_loco:ro
+      - ./logs:/opt/r1_train/logs
+      - is61-cache-kit:/isaac-sim/kit/cache
+      - is61-data-kit:/isaac-sim/kit/data
+      - is61-cache-ov:/root/.cache/ov
+      - is61-cache-gl:/root/.cache/nvidia/GLCache
+      - is61-cache-compute:/root/.nv/ComputeCache
+      - is61-logs:/root/.nvidia-omniverse/logs
+      - is61-carb-logs:/isaac-sim/kit/logs/Kit/Isaac-Sim
+      - is61-data:/root/.local/share/ov/data
+      - is61-r1-usd:/root/.cache/r1_sim
+    deploy: *gpu
+
+  mock-sim:
+    image: unitree-r1/teleop:2.3
+    profiles: ["mock"]
+    network_mode: host
+    entrypoint: ["python", "/opt/r1_sim/tests/mock_sim.py"]
+    environment:
+      <<: *dds-env
+      SIM_STEREO: ${SIM_STEREO:-1}
+      SIM_SCENE: ${SIM_SCENE:-assembly}
+      SIM_LOCOMOTION: ${SIM_LOCOMOTION:-1}
+      SIM_BODY: ${SIM_BODY:-exact}
+    volumes:
+      - ./r1_sim:/opt/r1_sim:ro
+
+volumes:
+  is61-cache-kit:
+  is61-data-kit:
+  is61-cache-ov:
+  is61-cache-gl:
+  is61-cache-compute:
+  is61-logs:
+  is61-carb-logs:
+  is61-data:
+  is61-r1-usd:

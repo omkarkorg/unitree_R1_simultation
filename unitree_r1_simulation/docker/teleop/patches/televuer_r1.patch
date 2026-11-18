@@ -1,0 +1,592 @@
+--- a/src/televuer/televuer.py
++++ b/src/televuer/televuer.py
+@@ -1,11 +1,13 @@
+ from vuer import Vuer
+ from vuer.schemas import ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
+ from multiprocessing import Value, Array, Process, shared_memory
++import json
+ import numpy as np
+ import asyncio
+ import threading
+ import cv2
+ import os
++import time
+ from pathlib import Path
+ from typing import Literal
+ 
+@@ -13,7 +15,7 @@
+ class TeleVuer:
+     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=None, display_fps: float=30.0,
+                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
+-                       cert_file: str=None, key_file: str=None):
++                       cert_file: str=None, key_file: str=None, view: dict=None, lab: dict=None):
+         """
+         TeleVuer class for OpenXR-based XR teleoperate applications.
+         This class handles the communication with the Vuer server and manages image and pose data.
+@@ -29,6 +31,18 @@
+         :param webrtc_url: str, URL for the webrtc offer. must be provided if webrtc is True.
+         :param cert_file: str, path to the SSL certificate file.
+         :param key_file: str, path to the SSL key file.
++        :param view: [R1 workspace patch] how the head camera image is shown in immersive mode (zmq), or None
++            for upstream behaviour (a head-locked plane 1 m tall at 1 m). Keys:
++              "vfov_deg":     the camera's vertical field of view; the image is shown at that angle (life-size)
++              "distance":     distance of the image plane (m)
++              "ipd":          binocular images: each eye's image is centred in front of that eye (m apart)
++              "world_locked": True: the image is placed in the room in the direction the robot's camera looked
++                              (render_to_xr's view_rotation) instead of moving with the operator's head
++        :param lab: [R1 workspace patch] immersive mode only: draw the simulated lab in the headset instead of the
++            camera image (lab_view.py). Keys: "description" (the simulator's layout, camera config key "lab"),
++            "urdf", "meshes" (robot model and its light meshes), "state_url" (the simulator's pose stream),
++            "show_hands" (small markers on the operator's tracked hand joints), "fps" (pose updates per second).
++            set_lab_placement() places the lab; set_ui() shows panels (buttons, status) in every mode.
+ 
+         Note:
+ 
+@@ -92,8 +106,19 @@
+         self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
+         if self.use_hand_tracking:
+             self.vuer.add_handler("HAND_MOVE")(self.on_hand_move)
++            self.vuer.add_handler("CONTROLLER_MOVE")(self.on_controller_watch)
+         else:
+             self.vuer.add_handler("CONTROLLER_MOVE")(self.on_controller_move)
++        self.view = view
++        self.xr_event_time_shared = Value('d', 0.0, lock=True)
++        self.hands_time_shared = Value('d', 0.0, lock=True)
++        self.controller_move_time_shared = Value('d', 0.0, lock=True)
++        self.view_rotation_shared = Array('d', 10, lock=True)
++        self._last_controller_poses = None
++        self.lab = lab
++        self.lab_placement_shared = Array('d', 17, lock=True)
++        self.ui_shared = Array('c', 65536, lock=True)
++        self.ui_version_shared = Value('i', 0, lock=True)
+ 
+         self.display_mode = display_mode
+         self.zmq = zmq
+@@ -101,7 +126,7 @@
+         self.webrtc_url = webrtc_url
+ 
+         if self.display_mode == "immersive":
+-            if self.webrtc:
++            if self.webrtc and self.lab is None:
+                 fn = self.main_image_binocular_webrtc if self.binocular else self.main_image_monocular_webrtc
+             elif self.zmq:
+                 self.img2display_shm = shared_memory.SharedMemory(create=True, size=np.prod(self.img_shape) * np.uint8().itemsize)
+@@ -114,6 +139,8 @@
+                 fn = self.main_image_binocular_zmq if self.binocular else self.main_image_monocular_zmq
+             else:
+                 raise ValueError("[TeleVuer] immersive mode requires zmq=True or webrtc=True.")
++            if self.lab is not None:
++                fn = self.main_lab
+         elif self.display_mode == "ego":
+             if self.webrtc:
+                 fn = self.main_image_binocular_webrtc_ego if self.binocular else self.main_image_monocular_webrtc_ego
+@@ -133,7 +160,8 @@
+         else:
+             raise ValueError(f"[TeleVuer] Unknown display_mode: {self.display_mode}")
+         
+-        self.vuer.spawn(start=False)(fn)
++        lab_mode = self.lab is not None and self.display_mode == "immersive"
++        self.vuer.spawn(start=False)(self._with_controller_watch(fn if lab_mode else self._with_ui(fn)))
+ 
+         self.head_pose_shared = Array('d', 16, lock=True)
+         self.left_arm_pose_shared = Array('d', 16, lock=True)
+@@ -195,15 +223,16 @@
+             self.new_frame_event.clear()
+             if self.latest_frame is None:
+                 continue
+-            latest_frame = self.latest_frame
++            latest_frame, view_rotation = self.latest_frame
+             latest_frame = cv2.cvtColor(latest_frame, cv2.COLOR_BGR2RGB)
+             self.img2display[:] = latest_frame
++            self._set_view_rotation(view_rotation)
+     
+-    def render_to_xr(self, image):
++    def render_to_xr(self, image, view_rotation=None):
+         if self.webrtc or self.display_mode == "pass-through":
+             print("[TeleVuer] Warning: render_to_xr is ignored when webrtc is enabled or pass_through is True.")
+             return
+-        self.latest_frame = image
++        self.latest_frame = (image, view_rotation)
+         self.new_frame_event.set()
+ 
+     def close(self):
+@@ -269,6 +298,8 @@
+ 
+     async def on_hand_move(self, event, session, fps=60):
+         """https://docs.vuer.ai/en/latest/examples/19_hand_tracking.html"""
++        with self.xr_event_time_shared.get_lock():
++            self.xr_event_time_shared.value = time.time()
+         try:
+             # HandsData
+             left_hand_data = event.value["left"]
+@@ -312,10 +343,191 @@
+             extract_hands(right_hand, "right")
+             with self.motion_data_ready_shared.get_lock():
+                 self.motion_data_ready_shared.value = True
++            with self.hands_time_shared.get_lock():
++                self.hands_time_shared.value = time.time()
+ 
+         except:
+             pass
+-    
++
++    async def on_controller_watch(self, event, session, fps=60):
++        now = time.time()
++        with self.xr_event_time_shared.get_lock():
++            self.xr_event_time_shared.value = now
++        try:
++            poses = (event.value.get("left"), event.value.get("right"))
++        except AttributeError:
++            return
++        with self.hands_time_shared.get_lock():
++            hands_reported = now - self.hands_time_shared.value < 0.25
++        if any(p is not None for p in poses):
++            if self._last_controller_poses is not None and poses != self._last_controller_poses and not hands_reported:
++                with self.controller_move_time_shared.get_lock():
++                    self.controller_move_time_shared.value = now
++            self._last_controller_poses = poses
++
++    def _with_controller_watch(self, fn):
++        if not self.use_hand_tracking:
++            return fn
++        async def main(session):
++            session.upsert(MotionControllers(stream=True, key="motionControllers", left=True, right=True), to="bgChildren")
++            await fn(session)
++        return main
++
++    def _set_view_rotation(self, rotation):
++        with self.view_rotation_shared.get_lock():
++            if rotation is None:
++                self.view_rotation_shared[9] = 0.0
++            else:
++                self.view_rotation_shared[:9] = np.asarray(rotation, dtype=float).reshape(9).tolist()
++                self.view_rotation_shared[9] = 1.0
++
++    def _image_planes(self, eyes):
++        if self.view is None:
++            return {eye: dict(height=1, distanceToCamera=1) for eye in eyes}
++        d = self.view["distance"]
++        size = dict(height=2.0 * d * np.tan(np.radians(self.view["vfov_deg"]) / 2.0), distanceToCamera=d)
++        offset = {"left": -self.view["ipd"] / 2.0, "right": self.view["ipd"] / 2.0, "mono": 0.0}
++        with self.view_rotation_shared.get_lock():
++            rotation = np.array(self.view_rotation_shared[:9]).reshape(3, 3)
++            valid = self.view_rotation_shared[9] > 0.5
++        head = self.head_pose
++        if not (self.view.get("world_locked") and valid and abs(np.linalg.det(head[:3, :3])) > 0.5):
++            return {eye: dict(size, position=[offset[eye], 0.0, 0.0]) for eye in eyes}
++        planes = {}
++        for eye in eyes:
++            pose = np.eye(4)
++            pose[:3, :3] = rotation
++            pose[:3, 3] = head[:3, 3] + head[:3, 0] * offset[eye] + rotation @ np.array([0.0, 0.0, -d])
++            planes[eye] = dict(size, fixed=True, matrix=pose.flatten(order="F").tolist())
++        return planes
++
++    def set_lab_placement(self, T):
++        with self.lab_placement_shared.get_lock():
++            self.lab_placement_shared[:16] = np.asarray(T, dtype=float).flatten(order="F").tolist()
++            self.lab_placement_shared[16] += 1.0
++
++    def _lab_placement(self):
++        with self.lab_placement_shared.get_lock():
++            raw = list(self.lab_placement_shared[:])
++        if raw[16] < 0.5:
++            T = np.eye(4)
++            T[:3, :3] = [[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]]
++            return T, 0.0
++        return np.array(raw[:16]).reshape(4, 4, order="F"), raw[16]
++
++    def set_ui(self, panels):
++        text = json.dumps(panels, separators=(",", ":")).encode()
++        if len(text) >= len(self.ui_shared) - 1:
++            raise ValueError("set_ui: too many panels")
++        with self.ui_shared.get_lock():
++            if self.ui_shared.value == text:
++                return
++            self.ui_shared.value = text
++        with self.ui_version_shared.get_lock():
++            self.ui_version_shared.value += 1
++
++    def _ui_panels(self):
++        with self.ui_version_shared.get_lock():
++            version = self.ui_version_shared.value
++        with self.ui_shared.get_lock():
++            text = self.ui_shared.value
++        return version, (json.loads(text) if text else [])
++
++    @staticmethod
++    async def _drained(session, timeout=5.0):
++        t_end = time.time() + timeout
++        while session.uplink_queue and time.time() < t_end:
++            await asyncio.sleep(0.01)
++
++    async def _ui_step(self, session, state, refresh=5.0):
++        from .lab_view import panel_node
++        version, panels = self._ui_panels()
++        now = time.time()
++        if version == state.get("version") and now - state.get("sent", 0.0) < refresh:
++            return
++        keys = {p["key"] for p in panels}
++        gone = [k for k in state.get("keys", set()) if k not in keys]
++        if version != state.get("version"):
++            state["images"] = {p["key"]: panel_node(p) for p in panels}
++        await self._drained(session, 1.0)
++        if gone:
++            session.remove @ gone
++        if panels:
++            session.upsert(list(state["images"].values()), to="bgChildren")
++        await self._drained(session, 1.0)
++        state.update(version=version, sent=now, keys=keys)
++
++    def _with_ui(self, fn):
++        async def main(session):
++            async def ui_loop():
++                state = {}
++                while True:
++                    await self._ui_step(session, state)
++                    await asyncio.sleep(0.05)
++            task = asyncio.ensure_future(ui_loop())
++            try:
++                await fn(session)
++            finally:
++                task.cancel()
++        return main
++
++    async def main_lab(self, session):
++        import zmq
++        from .lab_view import LabScene, lights
++        scene = LabScene(self.lab["description"], self.lab["urdf"], self.lab["meshes"])
++        ctx = zmq.Context.instance()
++        sub = ctx.socket(zmq.SUB)
++        sub.setsockopt(zmq.CONFLATE, 1)
++        sub.setsockopt(zmq.SUBSCRIBE, b"")
++        sub.connect(self.lab["state_url"])
++        def latest():
++            msg = None
++            try:
++                while True:
++                    msg = sub.recv(zmq.NOBLOCK)
++            except zmq.Again:
++                pass
++            return json.loads(msg) if msg else None
++        try:
++            state = None
++            for _ in range(50):
++                state = latest()
++                if state:
++                    break
++                await asyncio.sleep(0.02)
++            placement, placed = self._lab_placement()
++            session.upsert(lights() + [Hands(stream=True, key="hands", fps=90, hideLeft=not self.lab.get("show_hands", True),
++                                             hideRight=not self.lab.get("show_hands", True), showFrame=False)], to="bgChildren")
++            await self._drained(session)
++            session.upsert(scene.static_nodes(placement, state), to="bgChildren")
++            await self._drained(session)
++            q0 = state["q"] if state and len(state.get("q") or []) == len(scene.q_index) else np.zeros(len(scene.q_index))
++            for chunk in scene.robot_nodes(q0):
++                session.add(chunk, to="lab")
++                await self._drained(session)
++            ui, placed_sent = {}, time.time()
++            period = 1.0 / float(self.lab.get("fps", 90.0))
++            while True:
++                state = latest()
++                waited = time.time()
++                while state is None and time.time() - waited < period:
++                    await asyncio.sleep(0.002)
++                    state = latest()
++                t0 = time.time()
++                nodes = []
++                placement, version = self._lab_placement()
++                if version != placed or t0 - placed_sent > 1.0:
++                    placed, placed_sent = version, t0
++                    nodes.append({"key": "lab", "matrix": placement.flatten(order="F").tolist()})
++                if state:
++                    nodes += scene.updates(state)
++                if nodes:
++                    session.update @ nodes
++                await self._ui_step(session, ui)
++                await asyncio.sleep(max(0.0, period - (time.time() - t0)))
++        finally:
++            sub.close(0)
++
+     ## immersive MODE
+     async def main_image_binocular_zmq(self, session):
+         if self.use_hand_tracking:
+@@ -339,13 +551,12 @@
+                 to="bgChildren",
+             )
+         while True:
++            planes = self._image_planes(("left", "right"))
+             session.upsert(
+                 [
+                     ImageBackground(
+                         self.img2display[:, :self.img_width],
+                         aspect=self.aspect_ratio,
+-                        height=1,
+-                        distanceToCamera=1,
+                         # The underlying rendering engine supported a layer binary bitmask for both objects and the camera. 
+                         # Below we set the two image planes, left and right, to layers=1 and layers=2. 
+                         # Note that these two masks are associated with left eye’s camera and the right eye’s camera.
+@@ -354,17 +565,17 @@
+                         quality=80,
+                         key="background-left",
+                         interpolate=True,
++                        **planes["left"],
+                     ),
+                     ImageBackground(
+                         self.img2display[:, self.img_width:],
+                         aspect=self.aspect_ratio,
+-                        height=1,
+-                        distanceToCamera=1,
+                         layers=2,
+                         format="jpeg",
+                         quality=80,
+                         key="background-right",
+                         interpolate=True,
++                        **planes["right"],
+                     ),
+                 ],
+                 to="bgChildren",
+@@ -400,12 +611,11 @@
+                     ImageBackground(
+                         self.img2display,
+                         aspect=self.aspect_ratio,
+-                        height=1,
+-                        distanceToCamera=1,
+                         format="jpeg",
+                         quality=80,
+                         key="background-mono",
+                         interpolate=True,
++                        **self._image_planes(("mono",))["mono"],
+                     ),
+                 ],
+                 to="bgChildren",
+@@ -682,6 +892,21 @@
+ 
+     # ==================== common data ====================
+     @property
++    def xr_event_time(self):
++        with self.xr_event_time_shared.get_lock():
++            return self.xr_event_time_shared.value
++
++    @property
++    def hands_time(self):
++        with self.hands_time_shared.get_lock():
++            return self.hands_time_shared.value
++
++    @property
++    def controller_move_time(self):
++        with self.controller_move_time_shared.get_lock():
++            return self.controller_move_time_shared.value
++
++    @property
+     def head_pose(self):
+         """np.ndarray, shape (4, 4), head SE(3) pose matrix from Vuer (basis OpenXR Convention)."""
+         with self.head_pose_shared.get_lock():
+--- a/src/televuer/tv_wrapper.py
++++ b/src/televuer/tv_wrapper.py
+@@ -229,7 +229,7 @@
+     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=(480, 1280), display_fps: float=30.0,
+                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
+                        cert_file: str=None, key_file: str=None, return_hand_rot_data: bool=False,
+-                       arm_reference_mode: Literal["head_position", "head_yaw"]="head_yaw"):
++                       arm_reference_mode: Literal["head_position", "head_yaw"]="head_yaw", view: dict=None, lab: dict=None):
+         """
+         TeleVuerWrapper is a wrapper for the TeleVuer class, which handles XR device's data suit for robot control.
+         It initializes the TeleVuer instance with the specified parameters and provides a method to get motion state data.
+@@ -248,6 +248,8 @@
+         :param arm_reference_mode: str, controls how wrist poses are expressed for IK.
+             * "head_position": transfer from WORLD to HEAD with translation adjustment only.
+             * "head_yaw": default mode; transfer from WORLD to HEAD with R_Brobot_world_head_yaw^T, ignoring pitch/roll.
++        :param view: [R1 workspace patch] headset image placement, see TeleVuer.
++        :param lab: [R1 workspace patch] the headset draws the simulated lab instead of the image, see TeleVuer.
+ 
+         Note:
+ 
+@@ -279,7 +281,7 @@
+         self.arm_reference_mode = arm_reference_mode
+         self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
+                               display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url, 
+-                              cert_file=cert_file, key_file=key_file)
++                              cert_file=cert_file, key_file=key_file, view=view, lab=lab)
+         
+     def get_tele_data(self):
+         """
+--- /dev/null
++++ b/src/televuer/lab_view.py
+@@ -0,0 +1,175 @@
++import json
++
++import cv2
++import numpy as np
++from vuer.schemas import AmbientLight, Box, Cylinder, DirectionalLight, Group, HemisphereLight, ImageBackground, TriMesh
++
++HIDDEN_LINKS = ("head_pitch_link", "head_yaw_link")
++PANEL_PX_PER_M = 1400
++
++
++def column_major(T):
++    return [round(float(v), 5) for v in np.asarray(T, dtype=float).flatten(order="F")]
++
++
++def pose_matrix(pose_xyzw):
++    x, y, z, qx, qy, qz, qw = [float(v) for v in pose_xyzw]
++    n = np.sqrt(qx * qx + qy * qy + qz * qz + qw * qw) or 1.0
++    qx, qy, qz, qw = qx / n, qy / n, qz / n, qw / n
++    T = np.eye(4)
++    T[:3, :3] = [[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
++                 [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
++                 [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)]]
++    T[:3, 3] = [x, y, z]
++    return T
++
++
++def hex_colour(rgb):
++    return "#" + "".join(f"{int(round(255 * min(max(float(c), 0.0), 1.0))):02x}" for c in rgb[:3])
++
++
++class LabScene:
++    def __init__(self, description, urdf, meshes):
++        import pinocchio as pin
++        self.pin = pin
++        self.desc = description
++        self.model = pin.buildModelFromUrdf(urdf)
++        self.data = self.model.createData()
++        self.q_index = []
++        for name in description["joint_names"]:
++            if not self.model.existJointName(name):
++                raise ValueError(f"lab view: joint {name} of the simulator is not in {urdf}")
++            self.q_index.append(self.model.joints[self.model.getJointId(name)].idx_q)
++        d = np.load(meshes)
++        self.items = [(m["link"], m["colour"], d[f"v{i}"], d[f"f{i}"]) for i, m in enumerate(json.loads(str(d["meta"])))
++                      if m["link"] not in HIDDEN_LINKS]
++        self.frames = {}
++        for link in sorted({it[0] for it in self.items}):
++            fid = self.model.getFrameId(link)
++            if fid >= self.model.nframes:
++                raise ValueError(f"lab view: link {link} of the meshes is not in {urdf}")
++            self.frames[link] = fid
++        self.root = pose_matrix(description["robot_root"])
++        self.objects = {o["name"]: o for o in description["objects"]}
++        self.sent = {}
++
++    def link_poses(self, q):
++        qq = self.pin.neutral(self.model)
++        qq[self.q_index] = np.asarray(q, dtype=float)
++        self.pin.framesForwardKinematics(self.model, self.data, qq)
++        return {link: self.root @ self.data.oMf[fid].homogeneous for link, fid in self.frames.items()}
++
++    def static_nodes(self, placement, state=None):
++        hidden = np.eye(4)
++        hidden[2, 3] = -10.0
++        poses = (state or {}).get("objects") or {}
++        if (state or {}).get("root") is not None:
++            self.root = pose_matrix(state["root"])
++        children = []
++        for b in self.desc["boxes"]:
++            room = b["name"].startswith(("room", "wall", "ceiling", "floor"))
++            children.append(Box(key=f"lab-{b['name']}", args=list(b["size"]), position=list(b["center"]),
++                                materialType="standard", material={"color": hex_colour(b["colour"]), "roughness": 0.9},
++                                castShadow=not room, receiveShadow=True))
++        for m in self.desc.get("meshes", []):
++            children.append(TriMesh(key=f"lab-{m['name']}", vertices=np.asarray(m["vertices"], dtype=np.float32),
++                                    faces=np.asarray(m["faces"], dtype=np.uint32), color=hex_colour(m["colour"]),
++                                    materialType="standard", castShadow=True, receiveShadow=True))
++        for name, o in self.objects.items():
++            if o["shape"] == "mesh":
++                shape = TriMesh(key=f"obj-{name}-shape", vertices=np.asarray(o["vertices"], dtype=np.float32),
++                                faces=np.asarray(o["faces"], dtype=np.uint32), color=hex_colour(o["colour"]),
++                                materialType="standard", castShadow=True, receiveShadow=True)
++            elif o["shape"] == "cylinder":
++                shape = Cylinder(key=f"obj-{name}-shape", args=[o["radius"], o["radius"], o["height"], 32],
++                                 rotation=[np.pi / 2, 0.0, 0.0], materialType="standard",
++                                 material={"color": hex_colour(o["colour"]), "roughness": 0.5}, castShadow=True, receiveShadow=True)
++            else:
++                shape = Box(key=f"obj-{name}-shape", args=list(o["size"]), materialType="standard",
++                            material={"color": hex_colour(o["colour"]), "roughness": 0.5}, castShadow=True, receiveShadow=True)
++            T = pose_matrix(poses[name]) if name in poses else hidden
++            self.sent[f"obj-{name}"] = T
++            children.append(Group(shape, key=f"obj-{name}", matrix=column_major(T)))
++        return Group(*children, key="lab", matrix=column_major(placement))
++
++    def robot_nodes(self, q, chunk=12):
++        poses = self.link_poses(q)
++        by_link = {}
++        for k, (link, colour, v, f) in enumerate(self.items):
++            by_link.setdefault(link, []).append(TriMesh(key=f"mesh-{k}", vertices=v, faces=f, color=hex_colour(colour),
++                                                        materialType="standard", castShadow=True, receiveShadow=True))
++        groups = [Group(*meshes, key=f"link-{link}", matrix=column_major(poses[link])) for link, meshes in by_link.items()]
++        for link in by_link:
++            self.sent[f"link-{link}"] = poses[link]
++        return [groups[i:i + chunk] for i in range(0, len(groups), chunk)]
++
++    def updates(self, state):
++        nodes = []
++        if state.get("root") is not None:
++            self.root = pose_matrix(state["root"])
++        if state.get("q") is not None and len(state["q"]) == len(self.q_index):
++            for link, T in self.link_poses(state["q"]).items():
++                key = f"link-{link}"
++                prev = self.sent.get(key)
++                if prev is None or np.abs(prev - T).max() > 2e-4:
++                    self.sent[key] = T
++                    nodes.append({"key": key, "matrix": column_major(T)})
++        for name, pose in (state.get("objects") or {}).items():
++            if name in self.objects:
++                key, T = f"obj-{name}", pose_matrix(pose)
++                prev = self.sent.get(key)
++                if prev is None or np.abs(prev - T).max() > 2e-4:
++                    self.sent[key] = T
++                    nodes.append({"key": key, "matrix": column_major(T)})
++        return nodes
++
++
++def lights():
++    return [
++        AmbientLight(key="lab-ambient", intensity=0.55),
++        HemisphereLight(key="lab-hemisphere", intensity=0.6, color="#ffffff", groundColor="#8a8a8a"),
++        DirectionalLight(key="lab-sun", intensity=1.4, position=[0.6, 3.0, 0.8], castShadow=True,
++                         **{"shadow-mapSize": [1024, 1024], "shadow-bias": -0.0005, "shadow-normalBias": 0.02,
++                            "shadow-camera-left": -1.6, "shadow-camera-right": 1.6, "shadow-camera-top": 1.6,
++                            "shadow-camera-bottom": -1.6, "shadow-camera-near": 0.5, "shadow-camera-far": 6.0}),
++    ]
++
++
++def panel_image(spec):
++    w, h = (max(8, int(round(s * PANEL_PX_PER_M))) for s in spec["size"])
++    img = np.zeros((h, w, 3), np.uint8)
++    img[:] = spec.get("bg", (30, 34, 40))
++    border = spec.get("border")
++    if border:
++        t = max(3, h // 18)
++        cv2.rectangle(img, (t // 2, t // 2), (w - 1 - t // 2, h - 1 - t // 2), tuple(int(c) for c in border), t)
++    lines = [(str(text), float(scale)) for text, scale in spec.get("lines", []) if str(text)]
++    if not lines:
++        return img
++    font, fg = cv2.FONT_HERSHEY_DUPLEX, tuple(int(c) for c in spec.get("fg", (255, 255, 255)))
++    total = sum(scale for _, scale in lines)
++    unit = 0.62 * h / (total + 0.35 * (len(lines) - 1))
++    sizes = []
++    for text, scale in lines:
++        fs = cv2.getFontScaleFromHeight(font, max(4, int(unit * scale)), 2)
++        thick = max(1, int(round(fs * 1.6)))
++        (tw, th), _ = cv2.getTextSize(text, font, fs, thick)
++        if tw > 0.92 * w:
++            fs *= 0.92 * w / tw
++            thick = max(1, int(round(fs * 1.6)))
++            (tw, th), _ = cv2.getTextSize(text, font, fs, thick)
++        sizes.append((text, fs, thick, tw, th))
++    block = sum(s[4] for s in sizes) + 0.35 * unit * (len(sizes) - 1)
++    y = (h - block) / 2.0
++    for text, fs, thick, tw, th in sizes:
++        y += th
++        cv2.putText(img, text, (int((w - tw) / 2), int(y)), font, fs, fg, thick, cv2.LINE_AA)
++        y += 0.35 * unit
++    return img
++
++
++def panel_node(spec):
++    img = panel_image(spec)
++    h, w = img.shape[:2]
++    return ImageBackground(img, key=spec["key"], fixed=True, matrix=list(spec["matrix"]), height=float(spec["size"][1]),
++                           aspect=w / h, format="png", interpolate=True, distanceToCamera=1.0)
